@@ -18,6 +18,9 @@
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
+#include "gyroscopic-backend.h"
+#include "gyrolabe_qubec_matmul.h"
+#include "gyrolabe.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -4771,6 +4774,59 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 }
 
 namespace ggml::cpu::repack {
+static bool is_gyroscopic_q8_0_matmul_candidate(
+    const struct ggml_tensor * src0,
+    const struct ggml_tensor * src1,
+    const void * b,
+    int m,
+    int n,
+    int k,
+    int lda_bytes,
+    int ldb_bytes
+) {
+    if (src0 == nullptr || src1 == nullptr || b == nullptr) {
+        return false;
+    }
+    if (!ggml_gyroscopic_active()) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (m <= 0 || n <= 0 || k <= 0) {
+        return false;
+    }
+    if (lda_bytes <= 0 || ldb_bytes <= 0) {
+        return false;
+    }
+    if (src0->buffer == nullptr || src0->data == nullptr) {
+        return false;
+    }
+    if ((size_t) lda_bytes % sizeof(gyromatmul_block_q8_0) != 0 || (size_t) ldb_bytes % sizeof(gyromatmul_block_q8_0) != 0) {
+        return false;
+    }
+    const size_t lda_blocks = (size_t) lda_bytes / sizeof(gyromatmul_block_q8_0);
+    const size_t ldb_blocks = (size_t) ldb_bytes / sizeof(gyromatmul_block_q8_0);
+    if (lda_blocks == 0 || ldb_blocks == 0) {
+        return false;
+    }
+    if (src1->data == nullptr) {
+        return false;
+    }
+    if (src1->buffer == nullptr) {
+        return false;
+    }
+    const ptrdiff_t start = (const char *) b - (const char *) src1->data;
+    if (start < 0) {
+        return false;
+    }
+    const size_t need = (size_t) start + (size_t) n * (size_t) ldb_bytes;
+    if (need > ggml_nbytes(src1)) {
+        return false;
+    }
+    return (k % 32) == 0;
+}
+
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
         if (    op->op == GGML_OP_MUL_MAT &&
@@ -4779,11 +4835,24 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
                 ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
+            const bool q8_weight_candidate = is_gyroscopic_q8_0_matmul_candidate(
+                op->src[0],
+                op->src[1],
+                op->src[1]->data,
+                (int) op->src[0]->ne[1],
+                (int) op->src[1]->ne[1],
+                (int) op->src[0]->ne[0],
+                (int) op->src[0]->nb[1],
+                (int) ggml_row_size(GGML_TYPE_Q8_0, op->src[0]->ne[0])
+            );
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {
                 return true;
+            }
+            if (q8_weight_candidate) {
+                return false;
             }
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;
@@ -4795,11 +4864,24 @@ class extra_buffer_type : ggml::cpu::extra_buffer_type {
                 && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
                 && ggml_repack_get_optimal_repack_type(op->src[0])
                 ) {
+            const bool q8_id_candidate = is_gyroscopic_q8_0_matmul_candidate(
+                op->src[0],
+                op->src[1],
+                op->src[1]->data,
+                (int) op->src[0]->ne[1],
+                (int) op->src[1]->ne[1],
+                (int) op->src[0]->ne[0],
+                (int) op->src[0]->nb[1],
+                (int) ggml_row_size(GGML_TYPE_Q8_0, op->src[0]->ne[0])
+            );
             if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
                 return false;
             }
             if (op->src[1]->type == GGML_TYPE_F32) {
                 return true;
+            }
+            if (q8_id_candidate) {
+                return false;
             }
             //if (op->src[1]->type == GGML_TYPE_Q8_0) {
             //    return true;

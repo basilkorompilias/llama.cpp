@@ -2125,8 +2125,17 @@ static void * ggml_backend_cpu_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *)data;
 }
 
+static ggml_backend_cpu_buffer_free_pre_hook_t g_cpu_buffer_free_pre_hook = NULL;
+
+GGML_API void ggml_backend_cpu_register_buffer_free_pre_hook(ggml_backend_cpu_buffer_free_pre_hook_t hook) {
+    g_cpu_buffer_free_pre_hook = hook;
+}
+
 static void ggml_backend_cpu_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(buffer);
+    if (g_cpu_buffer_free_pre_hook != NULL) {
+        g_cpu_buffer_free_pre_hook(buffer);
+    }
     ggml_aligned_free(buffer->context, buffer->size);
 }
 

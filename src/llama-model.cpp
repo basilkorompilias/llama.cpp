@@ -16,10 +16,16 @@
 
 #include "models/models.h"
 
+#ifdef GGML_USE_GYROSCOPIC_GRAPH
+#include "gyrolabe_registry.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -7777,6 +7783,31 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+#if defined(GGML_USE_GYROSCOPIC) || defined(GGML_USE_GYROSCOPIC_GRAPH)
+    {
+        int gyro_tensors_scanned = 0;
+        int gyro_q8_0_tensors = 0;
+        for (auto & [ctx, _] : pimpl->ctxs_bufs) {
+            for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+                gyro_tensors_scanned++;
+                if (cur->type == GGML_TYPE_Q8_0 && cur->data != NULL) {
+                    gyro_q8_0_tensors++;
+                }
+                gyrolabe_registry_register_tensor(cur);
+            }
+        }
+#if defined(GGML_USE_GYROSCOPIC_GRAPH)
+        std::fprintf(
+            stderr,
+            "GYRO_REG: tensors_scanned=%d q8_0_tensors=%d registry_entries=%d\n",
+            gyro_tensors_scanned,
+            gyro_q8_0_tensors,
+            gyrolabe_registry_entry_count());
+        std::fflush(stderr);
+#endif
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

@@ -67,6 +67,9 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    typedef void (*ggml_backend_cpu_buffer_free_pre_hook_t)(ggml_backend_buffer_t buffer);
+    GGML_API void ggml_backend_cpu_register_buffer_free_pre_hook(ggml_backend_cpu_buffer_free_pre_hook_t hook);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy(struct ggml_tensor * src, struct ggml_tensor * dst);
 

@@ -9,6 +9,10 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 
+#ifdef GGML_USE_GYROSCOPIC_GRAPH
+#include "ggml-gyroscopic-graph.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1683,6 +1687,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // needs to happen before the graph is built
             n_outputs = n_outputs_new;
         }
+
+#ifdef GGML_USE_GYROSCOPIC_GRAPH
+        if (ubatch.token != nullptr) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const int32_t ns = ubatch.n_seq_id ? ubatch.n_seq_id[i] : 1;
+                for (int32_t s = 0; s < ns; ++s) {
+                    const llama_seq_id sid = ubatch.seq_id[i][s];
+                    if (sid >= 0 && sid < 256) {
+                        ggml_gyroscopic_graph_feed_token((uint32_t)sid, (uint32_t) ubatch.token[i]);
+                    }
+                }
+            }
+        }
+#endif
 
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);

@@ -1,7 +1,7 @@
 #include "vec.h"
 
 #ifdef GGML_USE_GYROSCOPIC
-#include "gyroscopic-bridge.h"
+#include "gyroscopic-backend.h"
 #endif
 
 #include <cassert>
@@ -23,9 +23,6 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
    if (ggml_gyroscopic_active()) {
        if (ggml_gyroscopic_vec_dot_f32(n, x, y, s)) {
            return;
-       }
-       if (ggml_gyroscopic_strict()) {
-           ggml_gyroscopic_abort_unsupported("ggml_vec_dot_f32", GGML_TYPE_F32, GGML_TYPE_F32);
        }
    }
 #endif

@@ -189,6 +189,8 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
+option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend + GyroGraph feed in ggml-base" OFF)
+
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -213,6 +215,18 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+    if (GGML_GYROSCOPIC)
+        target_sources(ggml-base PRIVATE
+            ggml-gyroscopic/gyroscopic-base.c
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_policy.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_registry.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_chi_gauge_tile.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_wht.c"
+        )
+        target_include_directories(ggml-base PRIVATE "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
+        target_compile_definitions(ggml-base PUBLIC GGML_USE_GYROSCOPIC_GRAPH=1)
+    endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

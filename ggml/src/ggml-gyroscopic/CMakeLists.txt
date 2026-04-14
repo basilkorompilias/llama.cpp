@@ -1,4 +1,6 @@
-option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend (gyrolabe codec + gyroscopic-bridge)" OFF)
+if(NOT DEFINED GGML_GYROSCOPIC)
+    option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend (gyrolabe codec + gyroscopic-backend)" OFF)
+endif()
 
 function(ggml_add_cpu_backend_features cpu_name arch)
     # The feature detection code is compiled as a separate target so that
@@ -698,19 +700,38 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     endif()
 
     if (GGML_GYROSCOPIC)
-        set(GYROLABE_CODEC "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe/codec.c")
-        set(GYROLABE_CODEC_INC "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe")
-        set(GYRO_BRIDGE_CPP "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic/gyroscopic-bridge.cpp")
+        set(
+            GYROLABE_CODEC
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_policy.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_wht.c"
+            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_qubec_matmul.c"
+        )
+        set(
+            GYROSCOPIC_SOURCES
+            ${GYROLABE_CODEC}
+            "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic/gyroscopic-backend.cpp"
+        )
+        set(GYROLABE_CODEC_INC "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
+        set(GYRO_BRIDGE_CPP "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic/gyroscopic-backend.cpp")
         set(GYRO_BRIDGE_INC "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic")
-        list(APPEND GGML_CPU_SOURCES "${GYROLABE_CODEC}" "${GYRO_BRIDGE_CPP}")
+        list(APPEND GGML_CPU_SOURCES ${GYROSCOPIC_SOURCES})
         target_include_directories(${GGML_CPU_NAME} PRIVATE "${GYROLABE_CODEC_INC}" "${GYRO_BRIDGE_INC}")
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_GYROSCOPIC=1)
         if (MSVC)
-            set_source_files_properties("${GYROLABE_CODEC}" PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
-            target_compile_options(${GGML_CPU_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2 /fp:strict>)
+            foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
+                set_source_files_properties("${_gyro_file}" PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
+            endforeach()
         else()
-            set_source_files_properties("${GYROLABE_CODEC}" PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-ffp-contract=off")
-            target_compile_options(${GGML_CPU_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-mavx2 -mf16c -ffp-contract=off>)
+            foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
+                set_source_files_properties("${_gyro_file}" PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-ffp-contract=off")
+            endforeach()
+        endif()
+        foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
+            set_property(SOURCE "${_gyro_file}" APPEND PROPERTY COMPILE_DEFINITIONS GYRO_TRACE_REGIMES=1)
+        endforeach()
+        if (NOT WIN32)
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE Threads::Threads)
         endif()
     endif()
 

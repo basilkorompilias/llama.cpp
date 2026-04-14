@@ -15,6 +15,11 @@
 #include "ggml.h"
 #include "common.h"
 
+#ifdef GGML_USE_GYROSCOPIC
+#include "gyroscopic-backend.h"
+#include "gyrolabe_registry.h"
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -191,11 +196,6 @@ typedef void * thread_ret_t;
 #include <sys/stat.h>
 #include <unistd.h>
 
-#endif
-
-#ifdef GGML_USE_GYROSCOPIC
-#include "gyroscopic-bridge.h"
-static atomic_int g_gyro_mul_mat_done = 0;
 #endif
 
 typedef pthread_t ggml_thread_t;
@@ -1171,9 +1171,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-    //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
-
-    // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
     }
@@ -1184,15 +1181,81 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // block-tiling attempt
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
-    // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
     float tmp[32];
+
+#ifdef GGML_USE_GYROSCOPIC
+    {
+        const bool gyro_q8_chunk_candidate =
+            ggml_gyroscopic_active() &&
+            type == GGML_TYPE_Q8_0 &&
+            vec_dot_type == GGML_TYPE_Q8_0 &&
+            dst->type == GGML_TYPE_F32 &&
+            (ne00 % 32) == 0 &&
+            num_rows_per_vec_dot == 1 &&
+            nb0 == sizeof(float) &&
+            (nb1 % sizeof(float) == 0) &&
+            ((src1->type != vec_dot_type) || src1_cont);
+        if (gyro_q8_chunk_candidate) {
+            const int64_t mrows = ir0_end - ir0_start;
+            const int64_t ncols = ir1_end - ir1_start;
+
+            if (mrows > 0 && ncols > 0) {
+                const int64_t ir1_last = ir1_end - 1;
+
+                const int64_t i13_start = ir1_start / (ne12 * ne1);
+                const int64_t i12_start = (ir1_start - i13_start * ne12 * ne1) / ne1;
+                const int64_t i11_start = ir1_start - i13_start * ne12 * ne1 - i12_start * ne1;
+                const int64_t i13_last = ir1_last / (ne12 * ne1);
+                const int64_t i12_last = (ir1_last - i13_last * ne12 * ne1) / ne1;
+                const bool same_panel = (i12_start == i12_last) && (i13_start == i13_last);
+                const bool contiguous_i11 = (i11_start + ncols <= ne1);
+
+                if (same_panel && contiguous_i11) {
+                    const int64_t i03 = i13_start / r3;
+                    const int64_t i02 = i12_start / r2;
+
+                    const char * a_base = (const char *) src0->data + (i02 * nb02 + i03 * nb03);
+                    const void * ap = a_base + (size_t) ir0_start * nb01;
+
+                    const size_t b_off = (size_t)(i11_start + i12_start * ne11 + i13_start * ne12 * ne11) * row_size;
+                    const void * bp = (const char *) wdata + b_off;
+
+                    float * cp = (float *) ((char *) dst->data + (i11_start * nb1 + i12_start * nb2 + i13_start * nb3)) + ir0_start;
+                    const int ldc = (int)(nb1 / sizeof(float));
+                    const int cell_idx = ggml_gyroscopic_graph_cell_idx((i12_start << 6) ^ (i11_start & 63));
+                    const int64_t gyro_row_start = ir0_start + i02 * ne01 + i03 * ne01 * ne02;
+                    const int64_t weight_row_base =
+                        i11_start + i12_start * ne1 + i13_start * ne12 * ne1;
+                    if (ggml_gyroscopic_mul_mat(
+                        cell_idx,
+                        src0,
+                        src1,
+                        ap,
+                        (const char *) bp,
+                        (const void *) src0->data,
+                        row_size,
+                        (int) mrows,
+                        (int) ncols,
+                        (int) ne00,
+                        weight_row_base > (int64_t) INT_MAX ? INT_MAX : (int) weight_row_base,
+                        src0,
+                        gyro_row_start > (int64_t) INT_MAX ? INT_MAX : (int) gyro_row_start,
+                        0,
+                        cp,
+                        ldc)
+                    ) {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+#endif
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
@@ -1211,19 +1274,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                 const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char*)wdata +
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
-
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
@@ -1252,6 +1307,7 @@ void ggml_compute_forward_mul_mat(
     enum ggml_type           const vec_dot_type         = type_traits_cpu[src0->type].vec_dot_type;
     ggml_from_float_t        const from_float           = type_traits_cpu[vec_dot_type].from_float;
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[src0->type].nrows;
+    const bool                        src1_cont            = ggml_is_contiguous(src1);
 
     GGML_ASSERT(ne0 == ne01);
     GGML_ASSERT(ne1 == ne11);
@@ -1267,18 +1323,12 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
-
-    // nb01 >= nb00 - src0 is not transposed
-    //   compute by src0 rows
-
-    // TODO: extract to "extra_op"
-#if GGML_USE_LLAMAFILE
-    // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-    const bool src1_cont = ggml_is_contiguous(src1);
-
+    // nb01 >= nb00 - src0 is not transposed
+    //   compute by src0 rows
+#if GGML_USE_LLAMAFILE
     if (src1_cont) {
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
@@ -1301,26 +1351,16 @@ UseGgmlGemm1:;
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
+        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw1 = row_size;
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-    #if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
-                }
-            }
-        }
-    #else
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -1333,7 +1373,6 @@ UseGgmlGemm1:;
                 }
             }
         }
-    #endif
     }
 
     if (ith == 0) {
@@ -1343,61 +1382,64 @@ UseGgmlGemm1:;
 
     ggml_barrier(params->threadpool);
 
+    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
 #ifdef GGML_USE_GYROSCOPIC
-    if (ggml_gyroscopic_active() && vec_dot_type == GGML_TYPE_Q8_0 && src0->type == GGML_TYPE_Q8_0
-        && dst->type == GGML_TYPE_F32 && (ne00 % 32) == 0 && params->threadpool != NULL) {
-        if (ith == 0) {
-            bool ok = true;
-            if (!(src1->type == vec_dot_type || src1->type == GGML_TYPE_F32)) {
-                ok = false;
-            } else if (src1->type == vec_dot_type && !ggml_is_contiguous(src1)) {
-                ok = false;
-            } else {
-                const int64_t r2 = ne12 / ne02;
-                const int64_t r3 = ne13 / ne03;
-                GGML_ASSERT(ne12 % ne02 == 0);
-                GGML_ASSERT(ne13 % ne03 == 0);
-                const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-                const size_t nbw2 = nbw1 * ne11;
-                const size_t nbw3 = nbw2 * ne12;
-                const int ldc = (int) (nb1 / sizeof(float));
-                if (ldc < (int) ne01) {
-                    ok = false;
-                } else {
-                    for (int64_t i13 = 0; i13 < ne13 && ok; ++i13) {
-                        for (int64_t i12 = 0; i12 < ne12 && ok; ++i12) {
-                            const char * ap = (const char *) src0->data + (i12 / r2) * nb02 + (i13 / r3) * nb03;
-                            const void * bp;
-                            size_t ldb_bytes;
-                            if (src1->type == vec_dot_type) {
-                                bp = (const char *) src1->data + i12 * nb12 + i13 * nb13;
-                                ldb_bytes = nb11;
-                            } else {
-                                GGML_ASSERT(params->wdata != NULL);
-                                bp = (const char *) params->wdata + i13 * nbw3 + i12 * nbw2;
-                                ldb_bytes = nbw1;
-                            }
-                            float * dp = (float *) ((char *) dst->data + i12 * nb2 + i13 * nb3);
-                            if (!ggml_gyroscopic_gemm_q8_0_q8_0(
-                                    (int) ne01,
-                                    (int) ne11,
-                                    (int) ne00,
-                                    ap,
-                                    (int) nb01,
-                                    bp,
-                                    (int) ldb_bytes,
-                                    dp,
-                                    ldc)) {
-                                ok = false;
-                            }
-                        }
-                    }
+    const bool gyro_q8_fast_candidate =
+        ggml_gyroscopic_active() &&
+        src0->type == GGML_TYPE_Q8_0 &&
+        vec_dot_type == GGML_TYPE_Q8_0 &&
+        dst->type == GGML_TYPE_F32 &&
+        (ne00 % 32) == 0 &&
+        nb0 == sizeof(float) &&
+        (nb1 % sizeof(float) == 0) &&
+        ((src1->type != vec_dot_type) || src1_cont);
+
+    if (gyro_q8_fast_candidate && ne11 > 0) {
+        const char * wdata = (src1->type == vec_dot_type) ? (const char *) src1->data : params->wdata;
+        const int64_t ldc = (int64_t) (nb1 / sizeof(float));
+        bool gyro_fast_ok = true;
+        for (int64_t i13 = 0; i13 < ne13 && gyro_fast_ok; ++i13) {
+            for (int64_t i12 = 0; i12 < ne12 && gyro_fast_ok; ++i12) {
+                const int64_t i03 = i13 / r3;
+                const int64_t i02 = i12 / r2;
+                const int64_t m0 = ((int64_t)ith * ne01) / nth;
+                const int64_t m1 = ((int64_t)(ith + 1) * ne01) / nth;
+
+                if (m1 <= m0) {
+                    continue;
                 }
+
+                const char * a_panel = (const char *) src0->data + i02 * nb02 + i03 * nb03;
+                const int64_t weight_row_base = i12 * ne11 + i13 * ne12 * ne11;
+                const char * bp = (const char *) wdata + (size_t) weight_row_base * row_size;
+                float * cp = (float *) ((char *) dst->data + i12 * nb2 + i13 * nb3) + m0;
+                const int cell_idx = ggml_gyroscopic_graph_cell_idx((i12 << 6) ^ ((int) (m0 >> 6) & 63));
+                const int64_t gyro_row_start = m0 + i02 * ne01 + i03 * ne01 * ne02;
+                if (ggml_gyroscopic_mul_mat(
+                        cell_idx,
+                        src0,
+                        src1,
+                        (const char *) a_panel + (size_t)m0 * (size_t) nb01,
+                        (const char *) bp,
+                        (const void *) src0->data,  /* weight base, not activation */
+                        row_size,
+                        (int) (m1 - m0),
+                        (int) ne11,
+                        (int) ne00,
+                        weight_row_base > (int64_t) INT_MAX ? INT_MAX : (int) weight_row_base,
+                        src0,  /* weight tensor for registry lookup, not src1 */
+                        gyro_row_start > (int64_t) INT_MAX ? INT_MAX : (int) gyro_row_start,
+                        0,
+                        cp,
+                        (int) ldc)) {
+                    continue;
+                }
+                gyro_fast_ok = false;
             }
-            atomic_store_explicit(&g_gyro_mul_mat_done, ok ? 1 : 0, memory_order_release);
         }
-        ggml_barrier(params->threadpool);
-        if (atomic_load_explicit(&g_gyro_mul_mat_done, memory_order_acquire)) {
+
+        if (gyro_fast_ok) {
             return;
         }
     }
@@ -1542,10 +1584,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 const int64_t  i1 = id;  // selected expert index
                 const int64_t  i2 = i12; // row
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char *) wdata +
                     (src1_cont || src1->type != vec_dot_type
                     ? (i11      + i12*ne11)*row_size
@@ -1633,17 +1671,6 @@ static void ggml_compute_forward_mul_mat_id(
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
-#if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = ith; i12 < ne12; i12 += nth) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                               ne10);
-                }
-            }
-        }
-#else
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
                 for (int64_t i11 = 0; i11 < ne11; ++i11) {
@@ -1656,7 +1683,6 @@ static void ggml_compute_forward_mul_mat_id(
                 }
             }
         }
-#endif
     }
 
     if (ith == 0) {

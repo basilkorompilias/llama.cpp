@@ -7,18 +7,8 @@
 
 #include "../../quants.h"
 #include "../../ggml-cpu-impl.h"
-#ifdef GGML_USE_GYROSCOPIC
-#include "../../gyroscopic-bridge.h"
-#include <stddef.h>
-#include <stdint.h>
-typedef struct {
-    uint16_t d;
-    int8_t   qs[32];
-} gyromatmul_block_q8_0_layout_chk;
-static_assert(sizeof(block_q8_0) == sizeof(gyromatmul_block_q8_0_layout_chk), "gyro q8_0 block size");
-static_assert(offsetof(block_q8_0, d) == offsetof(gyromatmul_block_q8_0_layout_chk, d), "gyro q8_0 d");
-static_assert(offsetof(block_q8_0, qs) == offsetof(gyromatmul_block_q8_0_layout_chk, qs), "gyro q8_0 qs");
-#endif
+#include "ggml-gyroscopic/gyroscopic-backend.h"
+#include "gyrolabe.h"
 
 #include <math.h>
 #include <string.h>
@@ -1036,12 +1026,11 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     const block_q8_0 * GGML_RESTRICT y = vy;
 
 #ifdef GGML_USE_GYROSCOPIC
-    if (ggml_gyroscopic_active()) {
-        if (ggml_gyroscopic_vec_dot_q8_0_q8_0(n, vx, vy, s)) {
+    if (ggml_gyroscopic_active() && !ggml_gyroscopic_strict() && nrc == 1 && n > 0 && (n % qk) == 0) {
+        const int n_blocks = n / qk;
+        if (gyromatmul_vec_dot_q8_0_q8_0_avx2(n_blocks, (const gyromatmul_block_q8_0 *) x, (const gyromatmul_block_q8_0 *) y, s) == 0) {
+            ggml_gyroscopic_q8dot_override_inc();
             return;
-        }
-        if (ggml_gyroscopic_strict()) {
-            ggml_gyroscopic_abort_unsupported("ggml_vec_dot_q8_0_q8_0", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
         }
     }
 #endif

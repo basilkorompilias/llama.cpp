@@ -8,7 +8,7 @@
 #include "unary-ops.h"
 #include "vec.h"
 #ifdef GGML_USE_GYROSCOPIC
-#include "gyroscopic-bridge.h"
+#include "gyroscopic-backend.h"
 #endif
 
 #include <algorithm>
