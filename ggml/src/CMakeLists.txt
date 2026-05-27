@@ -189,6 +189,8 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
+option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend + GyroGraph feed in ggml-base" OFF)
+
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -214,6 +216,20 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+if (GGML_GYROSCOPIC)
+    target_sources(ggml-base PRIVATE
+        ggml-gyroscopic/gyroscopic-base.c
+        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_kernel.c"
+        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_policy.c"
+        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_registry.c"
+        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_kernel_wht.c"
+        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_runtime.c"
+    )
+    target_include_directories(ggml-base PRIVATE "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
+    target_compile_definitions(ggml-base PUBLIC GGML_USE_GYROSCOPIC_GRAPH=1)
+    target_compile_definitions(ggml-base PUBLIC GYROLABE_WITH_GGML=1)
+    target_compile_definitions(ggml-base PRIVATE GYROLABE_WITH_GGML_BASE=1)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
@@ -292,10 +308,16 @@ function(ggml_add_backend_library backend)
     endif()
 endfunction()
 
+set(GGML_CPU_BACKEND_SUBDIR "ggml-cpu" CACHE STRING "ggml: CPU backend under ggml/src (ggml-cpu or ggml-gyroscopic)")
+
 function(ggml_add_backend backend)
     string(TOUPPER "GGML_${backend}" backend_id)
     if (${backend_id})
-        string(TOLOWER "ggml-${backend}" backend_target)
+        if (backend STREQUAL "CPU")
+            set(backend_target ${GGML_CPU_BACKEND_SUBDIR})
+        else()
+            string(TOLOWER "ggml-${backend}" backend_target)
+        endif()
         add_subdirectory(${backend_target})
         message(STATUS "Including ${backend} backend")
         if (NOT GGML_BACKEND_DL)

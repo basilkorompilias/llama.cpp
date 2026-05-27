@@ -53,6 +53,10 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 
 target_link_libraries(llama PUBLIC ggml)
 
+if (GGML_GYROSCOPIC)
+    target_include_directories(llama PRIVATE "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)

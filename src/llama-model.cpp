@@ -18,10 +18,16 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#if defined(GGML_USE_GYROSCOPIC) || defined(GGML_USE_GYROSCOPIC_GRAPH)
+#include "gyrolabe_api.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -32,6 +38,28 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(GGML_USE_GYROSCOPIC) || defined(GGML_USE_GYROSCOPIC_GRAPH)
+static bool llama_gyroscopic_env_truthy(const char * v) {
+    if (v == nullptr || v[0] == '\0') {
+        return false;
+    }
+    switch (v[0]) {
+        case '0':
+        case 'n':
+        case 'N':
+        case 'f':
+        case 'F':
+            return false;
+        default:
+            return true;
+    }
+}
+
+static bool llama_gyroscopic_runtime_active() {
+    return llama_gyroscopic_env_truthy(std::getenv("GGML_GYROSCOPIC"));
+}
+#endif
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
@@ -8024,6 +8052,44 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             return false;
         }
     }
+
+#if defined(GGML_USE_GYROSCOPIC) || defined(GGML_USE_GYROSCOPIC_GRAPH)
+    if (llama_gyroscopic_runtime_active()) {
+        int gyro_tensors_scanned = 0;
+        int gyro_q8_0_tensors = 0;
+        std::fprintf(stderr, "GYRO_REG_BEGIN\n");
+        std::fflush(stderr);
+        for (auto & [ctx, _] : pimpl->ctxs_bufs) {
+            for (struct ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur != NULL; cur = ggml_get_next_tensor(ctx.get(), cur)) {
+                gyro_tensors_scanned++;
+                if (cur->type == GGML_TYPE_Q8_0 && cur->data != NULL) {
+                    gyro_q8_0_tensors++;
+                    std::fprintf(
+                        stderr,
+                        "GYRO_REG_TENSOR: scanned=%d q8_0=%d name=%s ne=[%lld,%lld,%lld,%lld]\n",
+                        gyro_tensors_scanned,
+                        gyro_q8_0_tensors,
+                        ggml_get_name(cur),
+                        (long long) cur->ne[0],
+                        (long long) cur->ne[1],
+                        (long long) cur->ne[2],
+                        (long long) cur->ne[3]);
+                    std::fflush(stderr);
+                }
+                gyrolabe_registry_register_tensor(cur);
+            }
+        }
+        std::fprintf(
+            stderr,
+            "GYRO_REG: tensors_scanned=%d q8_0_tensors=%d registry_entries=%d\n",
+            gyro_tensors_scanned,
+            gyro_q8_0_tensors,
+            gyrolabe_registry_entry_count());
+        std::fflush(stderr);
+        std::fprintf(stderr, "GYRO_REG_DONE\n");
+        std::fflush(stderr);
+    }
+#endif
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
