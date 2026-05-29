@@ -11,35 +11,12 @@
 #include "llama-ext.h"
 #include "llama.h"
 
-#ifdef GGML_USE_GYROSCOPIC_GRAPH
-#include "ggml-gyroscopic-graph.h"
-#endif
-
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
-
-#ifdef GGML_USE_GYROSCOPIC_GRAPH
-static bool llama_gyroscopic_runtime_active() {
-    const char * v = std::getenv("GGML_GYROSCOPIC");
-    if (v == nullptr || v[0] == '\0') {
-        return false;
-    }
-    switch (v[0]) {
-        case '0':
-        case 'n':
-        case 'N':
-        case 'f':
-        case 'F':
-            return false;
-        default:
-            return true;
-    }
-}
-#endif
 
 //
 // llama_context
@@ -65,17 +42,6 @@ llama_context::llama_context(
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
-#ifdef GGML_USE_GYROSCOPIC_GRAPH
-    cparams.use_gyroscopic = llama_gyroscopic_runtime_active();
-    if (cparams.use_gyroscopic) {
-        if (cparams.n_seq_max > 256) {
-            throw std::runtime_error("Gyroscopic architecture requires n_seq_max <= 256");
-        }
-        LLAMA_LOG_INFO("%s: Gyroscopic architecture active (max sequences capped at 256)\n", __func__);
-    }
-#else
-    cparams.use_gyroscopic = false;
-#endif
 
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
@@ -1723,23 +1689,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
-#ifdef GGML_USE_GYROSCOPIC_GRAPH
-        if (cparams.use_gyroscopic) {
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const int32_t ns = ubatch.n_seq_id[i];
-                for (int32_t s = 0; s < ns; ++s) {
-                    const llama_seq_id sid = ubatch.seq_id[i][s];
-                    const llama_pos pos0 = ubatch.pos[i*ubatch.n_pos];
-                    ggml_gyroscopic_graph_feed_token((uint32_t)sid, (uint32_t) ubatch.token[i]);
-                    ggml_gyroscopic_graph_feed_kv_event(
-                        (uint32_t) sid,
-                        (uint32_t) pos0,
-                        1u,
-                        (uint32_t) pos0);
-                }
-            }
-        }
-#endif
         ggml_status status;
         const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
 

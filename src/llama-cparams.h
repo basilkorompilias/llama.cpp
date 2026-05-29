@@ -39,7 +39,6 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
-    bool use_gyroscopic = false;
 
     enum llama_pooling_type pooling_type;
 

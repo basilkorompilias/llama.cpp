@@ -189,7 +189,7 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend + GyroGraph feed in ggml-base" OFF)
+option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend (kernel gravity scale hook)" OFF)
 
 add_library(ggml-base
             ../include/ggml.h
@@ -217,18 +217,19 @@ set_target_properties(ggml-base PROPERTIES
 
 target_include_directories(ggml-base PRIVATE .)
 if (GGML_GYROSCOPIC)
-    target_sources(ggml-base PRIVATE
-        ggml-gyroscopic/gyroscopic-base.c
-        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_kernel.c"
-        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_policy.c"
-        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_registry.c"
-        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_kernel_wht.c"
-        "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_runtime.c"
-    )
-    target_include_directories(ggml-base PRIVATE "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
-    target_compile_definitions(ggml-base PUBLIC GGML_USE_GYROSCOPIC_GRAPH=1)
-    target_compile_definitions(ggml-base PUBLIC GYROLABE_WITH_GGML=1)
-    target_compile_definitions(ggml-base PRIVATE GYROLABE_WITH_GGML_BASE=1)
+    # Gyroscopic backend = vanilla ggml-cpu duplicate (ggml-gyroscopic/) plus the
+    # self-contained per-group scale hook in ggml-gyroscopic/quants.c. The kernel
+    # (src/tools/gyroscopic/kernel.c) is compiled into the backend via the
+    # ggml-gyroscopic CMakeLists so the hook can author scales from CGM constants.
+    # ggml-base itself needs no extra sources; the backend subdir does the work.
+    target_compile_definitions(ggml-base PUBLIC GGML_USE_GYROSCOPIC=1)
+    if (GGML_OPENMP)
+        find_package(OpenMP)
+        if (OpenMP_FOUND)
+            target_compile_options(ggml-base PRIVATE $<TARGET_PROPERTY:OpenMP::OpenMP_C,INTERFACE_COMPILE_OPTIONS>)
+            target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C)
+        endif()
+    endif()
 endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)

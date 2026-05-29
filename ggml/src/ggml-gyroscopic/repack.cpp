@@ -14,11 +14,9 @@
 #include <cmath>
 #include <cstring>
 #include <cassert>
-#include <cstdint>
 #include <cstdio>  // for GGML_ASSERT
 
 #include "repack.h"
-#include "gyroscopic-backend.h"
 
 #if defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Woverlength-strings"
@@ -4772,57 +4770,41 @@ static size_t ggml_backend_cpu_repack_buffer_type_get_alignment(ggml_backend_buf
 }
 
 namespace ggml::cpu::repack {
-static bool is_gyroscopic_q8_0_matmul_candidate(
-    const struct ggml_tensor * src0,
-    const struct ggml_tensor * src1,
-    int k
-) {
-    if (!ggml_gyroscopic_active()) {
-        return false;
-    }
-    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_Q8_0) {
-        return false;
-    }
-    return (k % 32) == 0;
-}
-
-class extra_buffer_type : public ggml::cpu::extra_buffer_type {
+class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
-        if (op->op != GGML_OP_MUL_MAT && op->op != GGML_OP_MUL_MAT_ID) {
-            return false;
+        if (    op->op == GGML_OP_MUL_MAT &&
+                op->src[0]->buffer &&
+                (ggml_n_dims(op->src[0]) == 2) &&
+                op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type() &&
+                ggml_repack_get_optimal_repack_type(op->src[0])
+                ) {
+            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            if (op->src[1]->type == GGML_TYPE_F32) {
+                return true;
+            }
+            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
+            //    return true;
+            //}
+            // may be possible if Q8_0 packed...
+        } else if (op->op == GGML_OP_MUL_MAT_ID
+                && op->src[0]->buffer
+                && (ggml_n_dims(op->src[0]) == 3)
+                && op->src[0]->buffer->buft == ggml_backend_cpu_repack_buffer_type()
+                && ggml_repack_get_optimal_repack_type(op->src[0])
+                ) {
+            if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
+                return false;
+            }
+            if (op->src[1]->type == GGML_TYPE_F32) {
+                return true;
+            }
+            //if (op->src[1]->type == GGML_TYPE_Q8_0) {
+            //    return true;
+            //}
         }
-
-        // Path split at the boundary:
-        // - Gyroscopic backend owns Q8_0 weights × Q8_0 activations.
-        // - Repack owns Q8_0 weights × F32 activations.
-        // This keeps stock and gyroscopic paths mutually exclusive.
-        if (!op->src[0]->buffer || op->src[0]->buffer->buft != ggml_backend_cpu_repack_buffer_type()) {
-            return false;
-        }
-        if (!ggml_repack_get_optimal_repack_type(op->src[0])) {
-            return false;
-        }
-        const int dims = (op->op == GGML_OP_MUL_MAT) ? 2 : 3;
-        if (ggml_n_dims(op->src[0]) != dims) {
-            return false;
-        }
-
-        const bool q8_q8_candidate = is_gyroscopic_q8_0_matmul_candidate(
-            op->src[0],
-            op->src[1],
-            (int) op->src[0]->ne[0]
-        );
-        if (q8_q8_candidate) {
-            return false;
-        }
-
-        if (op->src[1]->type != GGML_TYPE_F32) {
-            return false;
-        }
-        if (op->src[1]->buffer && !ggml_backend_buft_is_host(op->src[1]->buffer->buft)) {
-            return false;
-        }
-        return true;
+        return false;
     }
 
     ggml::cpu::tensor_traits * get_tensor_traits(const struct ggml_tensor * op) override {

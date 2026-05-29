@@ -1,7 +1,3 @@
-if(NOT DEFINED GGML_GYROSCOPIC)
-    option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend (gyrolabe codec + gyroscopic-backend)" OFF)
-endif()
-
 function(ggml_add_cpu_backend_features cpu_name arch)
     # The feature detection code is compiled as a separate target so that
     # it can be built without the architecture flags
@@ -30,36 +26,45 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
     ggml_add_backend_library(${GGML_CPU_NAME})
 
+    # Gyroscopic backend: this is a duplicate of ggml-cpu living in
+    # ggml-gyroscopic/. Sources MUST be referenced with the ggml-gyroscopic/
+    # prefix (the function is invoked from ggml/src/), otherwise the build would
+    # silently compile the vanilla ggml-cpu files and our scale hook in
+    # ggml-gyroscopic/quants.c would never be included.
+    set(GYRO_DIR ggml-gyroscopic)
     list (APPEND GGML_CPU_SOURCES
-        ggml-gyroscopic/ggml-cpu.c
-        ggml-gyroscopic/ggml-cpu.cpp
-        ggml-gyroscopic/repack.cpp
-        ggml-gyroscopic/repack.h
-        ggml-gyroscopic/hbm.cpp
-        ggml-gyroscopic/hbm.h
-        ggml-gyroscopic/quants.c
-        ggml-gyroscopic/quants.h
-        ggml-gyroscopic/traits.cpp
-        ggml-gyroscopic/traits.h
-        ggml-gyroscopic/amx/amx.cpp
-        ggml-gyroscopic/amx/amx.h
-        ggml-gyroscopic/amx/mmq.cpp
-        ggml-gyroscopic/amx/mmq.h
-        ggml-gyroscopic/ggml-cpu-impl.h
-        ggml-gyroscopic/common.h
-        ggml-gyroscopic/binary-ops.h
-        ggml-gyroscopic/binary-ops.cpp
-        ggml-gyroscopic/unary-ops.h
-        ggml-gyroscopic/unary-ops.cpp
-        ggml-gyroscopic/simd-mappings.h
-        ggml-gyroscopic/vec.h
-        ggml-gyroscopic/vec.cpp
-        ggml-gyroscopic/ops.h
-        ggml-gyroscopic/ops.cpp
+        ${GYRO_DIR}/ggml-cpu.c
+        ${GYRO_DIR}/ggml-cpu.cpp
+        ${GYRO_DIR}/repack.cpp
+        ${GYRO_DIR}/repack.h
+        ${GYRO_DIR}/hbm.cpp
+        ${GYRO_DIR}/hbm.h
+        ${GYRO_DIR}/quants.c
+        ${GYRO_DIR}/quants.h
+        ${GYRO_DIR}/traits.cpp
+        ${GYRO_DIR}/traits.h
+        ${GYRO_DIR}/amx/amx.cpp
+        ${GYRO_DIR}/amx/amx.h
+        ${GYRO_DIR}/amx/mmq.cpp
+        ${GYRO_DIR}/amx/mmq.h
+        ${GYRO_DIR}/ggml-cpu-impl.h
+        ${GYRO_DIR}/common.h
+        ${GYRO_DIR}/binary-ops.h
+        ${GYRO_DIR}/binary-ops.cpp
+        ${GYRO_DIR}/unary-ops.h
+        ${GYRO_DIR}/unary-ops.cpp
+        ${GYRO_DIR}/simd-mappings.h
+        ${GYRO_DIR}/vec.h
+        ${GYRO_DIR}/vec.cpp
+        ${GYRO_DIR}/ops.h
+        ${GYRO_DIR}/ops.cpp
+        # Gyroscopic kernel: authors the per-group scales the hook applies.
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/tools/gyroscopic/kernel.c"
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-gyroscopic)
+    target_include_directories(${GGML_CPU_NAME} PRIVATE . ${GYRO_DIR}
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../../src/tools/gyroscopic")
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)
@@ -110,8 +115,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES
-            ggml-gyroscopic/arch/arm/quants.c
-            ggml-gyroscopic/arch/arm/repack.cpp
+            ggml-cpu/arch/arm/quants.c
+            ggml-cpu/arch/arm/repack.cpp
             )
 
         if (MSVC AND NOT CMAKE_C_COMPILER_ID STREQUAL "Clang")
@@ -389,7 +394,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "PowerPC")
         message(STATUS "PowerPC detected")
-        list(APPEND GGML_CPU_SOURCES ggml-gyroscopic/arch/powerpc/quants.c)
+        list(APPEND GGML_CPU_SOURCES ggml-cpu/arch/powerpc/quants.c)
         if (GGML_NATIVE)
             if (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")
                 file(READ "/proc/cpuinfo" POWER10_M)
@@ -438,7 +443,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         endif()
     elseif (GGML_SYSTEM_ARCH STREQUAL "loongarch64")
         message(STATUS "loongarch64 detected")
-        list(APPEND GGML_CPU_SOURCES ggml-gyroscopic/arch/loongarch/quants.c)
+        list(APPEND GGML_CPU_SOURCES ggml-cpu/arch/loongarch/quants.c)
 
         list(APPEND ARCH_FLAGS -march=loongarch64)
         if (GGML_LASX)
@@ -450,16 +455,16 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     elseif (GGML_SYSTEM_ARCH STREQUAL "riscv64")
         message(STATUS "riscv64 detected")
         list(APPEND GGML_CPU_SOURCES
-            ggml-gyroscopic/arch/riscv/quants.c
-            ggml-gyroscopic/arch/riscv/repack.cpp
+            ggml-cpu/arch/riscv/quants.c
+            ggml-cpu/arch/riscv/repack.cpp
             )
         if (GGML_CPU_RISCV64_SPACEMIT)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
             list(APPEND GGML_CPU_SOURCES
-                ggml-gyroscopic/spacemit/ime.cpp
-                ggml-gyroscopic/spacemit/ime.h
-                ggml-gyroscopic/spacemit/ime1_kernels.cpp
-                ggml-gyroscopic/spacemit/ime_kernels.h
+                ggml-cpu/spacemit/ime.cpp
+                ggml-cpu/spacemit/ime.h
+                ggml-cpu/spacemit/ime1_kernels.cpp
+                ggml-cpu/spacemit/ime_kernels.h
             )
         endif()
         if(NOT GGML_CPU_ALL_VARIANTS)
@@ -506,7 +511,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
     elseif (GGML_SYSTEM_ARCH STREQUAL "s390x")
         message(STATUS "s390x detected")
         list(APPEND GGML_CPU_SOURCES
-            ggml-gyroscopic/arch/s390/quants.c)
+            ggml-cpu/arch/s390/quants.c)
 
         # for native compilation
         if (GGML_NATIVE)
@@ -557,7 +562,7 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml_add_cpu_backend_features(${GGML_CPU_NAME} s390 ${ARCH_DEFINITIONS})
     elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
         message(STATUS "Wasm detected")
-        list (APPEND GGML_CPU_SOURCES ggml-gyroscopic/arch/wasm/quants.c)
+        list (APPEND GGML_CPU_SOURCES ggml-cpu/arch/wasm/quants.c)
     else()
         message(WARNING "Unknown CPU architecture. Falling back to generic implementations.")
         list(APPEND ARCH_FLAGS -DGGML_CPU_GENERIC)
@@ -614,10 +619,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         add_compile_definitions(GGML_USE_CPU_KLEIDIAI)
 
         list(APPEND GGML_CPU_SOURCES
-            ggml-gyroscopic/kleidiai/kleidiai.cpp
-            ggml-gyroscopic/kleidiai/kernels.cpp
-            ggml-gyroscopic/kleidiai/kleidiai.h
-            ggml-gyroscopic/kleidiai/kernels.h
+            ggml-cpu/kleidiai/kleidiai.cpp
+            ggml-cpu/kleidiai/kernels.cpp
+            ggml-cpu/kleidiai/kleidiai.h
+            ggml-cpu/kleidiai/kernels.h
             )
 
         # KleidiAI
@@ -697,51 +702,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
 
         set_source_files_properties(${GGML_KLEIDIAI_SOURCES} PROPERTIES COMPILE_OPTIONS "${PRIVATE_ARCH_FLAGS}")
         list(APPEND GGML_CPU_SOURCES ${GGML_KLEIDIAI_SOURCES})
-    endif()
-
-    if (GGML_GYROSCOPIC)
-        set(
-            GYROLABE_CODEC
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_policy.c"
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrograph_kernel.c"
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_runtime.c"
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_kernel_wht.c"
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_registry.c"
-            "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic/gyrolabe_kernel_qubec_matmul.c"
-        )
-        set(
-            GYROSCOPIC_SOURCES
-            ${GYROLABE_CODEC}
-            "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic/gyroscopic-backend.cpp"
-        )
-        set(GYROLABE_CODEC_INC "${CMAKE_SOURCE_DIR}/../../src/tools/gyroscopic")
-        set(GYRO_BRIDGE_CPP "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic/gyroscopic-backend.cpp")
-        set(GYRO_BRIDGE_INC "${CMAKE_SOURCE_DIR}/ggml/src/ggml-gyroscopic")
-        list(APPEND GGML_CPU_SOURCES ${GYROSCOPIC_SOURCES})
-        target_include_directories(${GGML_CPU_NAME} PRIVATE "${GYROLABE_CODEC_INC}" "${GYRO_BRIDGE_INC}")
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_GYROSCOPIC=1)
-        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GYROLABE_WITH_GGML=1)
-        if (BUILD_SHARED_LIBS)
-            # gyrolabe_api.h uses GGML_API from ggml.h.
-            # These sources are compiled into the backend DLL itself, so they must
-            # export symbols instead of seeing them as dllimport on Windows.
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_BUILD)
-        endif()
-        if (MSVC)
-            foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
-                set_source_files_properties("${_gyro_file}" PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:strict")
-            endforeach()
-        else()
-            foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
-                set_source_files_properties("${_gyro_file}" PROPERTIES COMPILE_OPTIONS "-mavx2;-mf16c;-ffp-contract=off")
-            endforeach()
-        endif()
-        foreach (_gyro_file IN LISTS GYROSCOPIC_SOURCES)
-            set_property(SOURCE "${_gyro_file}" APPEND PROPERTY COMPILE_DEFINITIONS GYRO_TRACE_REGIMES=1)
-        endforeach()
-        if (NOT WIN32)
-            target_link_libraries(${GGML_CPU_NAME} PRIVATE Threads::Threads)
-        endif()
     endif()
 
     message(STATUS "Adding CPU backend variant ${GGML_CPU_NAME}: ${ARCH_FLAGS} ${ARCH_DEFINITIONS}")

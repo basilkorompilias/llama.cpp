@@ -1,9 +1,5 @@
 #include "vec.h"
 
-#ifdef GGML_USE_GYROSCOPIC
-#include "gyroscopic-backend.h"
-#endif
-
 #include <cassert>
 
 // precomputed gelu table for f16 (128 KB)
@@ -18,14 +14,6 @@ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * G
    GGML_UNUSED(bx);
    GGML_UNUSED(by);
    GGML_UNUSED(bs);
-
-#ifdef GGML_USE_GYROSCOPIC
-   if (ggml_gyroscopic_active()) {
-       if (ggml_gyroscopic_vec_dot_f32(n, x, y, s)) {
-           return;
-       }
-   }
-#endif
 
 #if defined(GGML_SIMD)
     float sumf = 0.0f;

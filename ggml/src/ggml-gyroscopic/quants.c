@@ -7,12 +7,17 @@
 #include "quants.h"
 
 #include "arch-fallback.h"
+#include "kernel.h"
 
 #include <string.h>
 #include <assert.h>
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
+
+#if defined(_MSC_VER)
+#  include <windows.h>
+#endif
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -21,6 +26,132 @@
 #define GROUP_MAX_EPS_IQ1_S 1e-12f
 
 #define UNUSED GGML_UNUSED
+
+/* ---------------------------------------------------------------------------
+ * Gyroscopic scale hook.
+ *
+ * The kernel AUTHORS the per-group magnitude; llama only APPLIES it. This is
+ * the one and only insertion point: a thread-local gravity attenuation factor
+ * that multiplies the Q1_0 FP16 scale at its single load site below.
+ *
+ * Default = 1.0f  -> bit-identical to stock Q1_0 (no behavioral change).
+ * The caller (model-load glue) sets the factor per layer to exp(g1 * L/N)
+ * via gyroscopic_set_gravity_factor(); the matmul arithmetic is unchanged.
+ * Per-group sign analysis and route stats run ONLY when GGML_GYROSCOPIC_TRACE=1.
+ * No custom matmul, no callback in the inner loop.
+ * ------------------------------------------------------------------------- */
+#if defined(_MSC_VER)
+#  define GYRO_THREAD_LOCAL __declspec(thread)
+#else
+#  define GYRO_THREAD_LOCAL __thread
+#endif
+static GYRO_THREAD_LOCAL float g_gyroscopic_gravity_factor = 1.0f;
+static int g_gyroscopic_trace_enabled = -1;
+static uint64_t g_gyroscopic_path_count[GYROSCOPIC_PATH_COUNT];
+static uint64_t g_gyroscopic_group_count = 0;
+
+void gyroscopic_set_gravity_factor(float factor) {
+    g_gyroscopic_gravity_factor = (factor > 0.0f) ? factor : 1.0f;
+    if (g_gyroscopic_trace_enabled < 0) {
+        const char * e = getenv("GGML_GYROSCOPIC_TRACE");
+        g_gyroscopic_trace_enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+}
+
+float gyroscopic_get_gravity_factor(void) {
+    return g_gyroscopic_gravity_factor;
+}
+
+void gyroscopic_reset_matmul_stats(void) {
+    memset(g_gyroscopic_path_count, 0, sizeof(g_gyroscopic_path_count));
+    g_gyroscopic_group_count = 0;
+}
+
+const gyroscopic_matmul_stats * gyroscopic_get_matmul_stats(void) {
+    static GYRO_THREAD_LOCAL gyroscopic_matmul_stats snapshot;
+    snapshot.groups = g_gyroscopic_group_count;
+    memcpy(snapshot.path_count, g_gyroscopic_path_count, sizeof(snapshot.path_count));
+    return &snapshot;
+}
+
+static int gyroscopic_trace_enabled_internal(void) {
+    if (g_gyroscopic_trace_enabled < 0) {
+        const char * e = getenv("GGML_GYROSCOPIC_TRACE");
+        g_gyroscopic_trace_enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+    return g_gyroscopic_trace_enabled;
+}
+
+int gyroscopic_trace_enabled(void) {
+    return gyroscopic_trace_enabled_internal();
+}
+
+static void gyroscopic_record_route(uint8_t path) {
+#if defined(_MSC_VER)
+    InterlockedIncrement64((volatile LONG64 *) &g_gyroscopic_group_count);
+    if (path < GYROSCOPIC_PATH_COUNT) {
+        InterlockedIncrement64((volatile LONG64 *) &g_gyroscopic_path_count[path]);
+    }
+#else
+    __sync_fetch_and_add(&g_gyroscopic_group_count, 1);
+    if (path < GYROSCOPIC_PATH_COUNT) {
+        __sync_fetch_and_add(&g_gyroscopic_path_count[path], 1);
+    }
+#endif
+}
+
+void gyroscopic_maybe_log_matmul_stats(void) {
+    if (!gyroscopic_trace_enabled_internal()) {
+        return;
+    }
+    if (g_gyroscopic_group_count == 0) {
+        return;
+    }
+    fprintf(stderr,
+        "GYROSCOPIC: groups=%llu iso=%llu cs=%llu una=%llu ona=%llu bu=%llu depth=%.6f\n",
+        (unsigned long long) g_gyroscopic_group_count,
+        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_ISOTROPIC],
+        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_CS],
+        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_UNA],
+        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_ONA],
+        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_BU],
+        (double) g_gyroscopic_gravity_factor);
+    fflush(stderr);
+}
+
+float gyroscopic_q1_group_scale(const block_q1_0 * block) {
+    const float depth = g_gyroscopic_gravity_factor;
+
+    if (block == NULL) {
+        return depth;
+    }
+
+    if (g_gyroscopic_trace_enabled == 1) {
+        gyroscopic_trace_q1_group(block);
+    }
+
+    return GYROSCOPIC_Q1_WEIGHT_D(block, depth);
+}
+
+void gyroscopic_trace_q1_group(const block_q1_0 * block) {
+    uint8_t shell = 0;
+    uint8_t k4 = 0;
+
+    if (block == NULL || g_gyroscopic_trace_enabled != 1) {
+        return;
+    }
+
+    gyroscopic_analyze_q1_group(block->qs, NULL, &shell, &k4);
+    gyroscopic_record_route(gyroscopic_route_path(shell, k4));
+}
+
+void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q1_0_ref(x, y, k);
+}
+
+void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q2_0_ref(x, y, k);
+}
 
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
@@ -115,6 +246,109 @@ void quantize_row_q8_K_generic(const float * GGML_RESTRICT x, void * GGML_RESTRI
 }
 
 //===================================== Dot products =================================
+
+void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK1_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q1_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const float gyro_depth = gyroscopic_get_gravity_factor();
+    const int   gyro_trace = gyroscopic_trace_enabled_internal();
+
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        if (gyro_trace) {
+            gyroscopic_trace_q1_group(&x[i]);
+        }
+        const float d0 = GYROSCOPIC_Q1_WEIGHT_D(&x[i], gyro_depth);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
+
+            const uint8_t * GGML_RESTRICT bits = &x[i].qs[k * 4];
+            const int8_t  * GGML_RESTRICT qy   = yb->qs;
+
+            for (int b = 0; b < 4; ++b, qy += 8) {
+                const unsigned mask = bits[b];
+                sumi_block += ((mask & 0x01) ? qy[0] : -qy[0])
+                           +  ((mask & 0x02) ? qy[1] : -qy[1])
+                           +  ((mask & 0x04) ? qy[2] : -qy[2])
+                           +  ((mask & 0x08) ? qy[3] : -qy[3])
+                           +  ((mask & 0x10) ? qy[4] : -qy[4])
+                           +  ((mask & 0x20) ? qy[5] : -qy[5])
+                           +  ((mask & 0x40) ? qy[6] : -qy[6])
+                           +  ((mask & 0x80) ? qy[7] : -qy[7]);
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK2_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_q2_0 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 4; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            int sumi_block = 0;
+
+            const uint8_t * GGML_RESTRICT qs = &x[i].qs[k * 8];
+            const int8_t  * GGML_RESTRICT qy = yb->qs;
+
+            for (int b = 0; b < 8; ++b) {
+                const uint8_t byte = qs[b];
+                // Extract 4 two-bit values, map {0,1,2,3} -> {-1,0,1,2}
+                sumi_block += ((int)((byte >> 0) & 3) - 1) * qy[b*4 + 0];
+                sumi_block += ((int)((byte >> 2) & 3) - 1) * qy[b*4 + 1];
+                sumi_block += ((int)((byte >> 4) & 3) - 1) * qy[b*4 + 2];
+                sumi_block += ((int)((byte >> 6) & 3) - 1) * qy[b*4 + 3];
+            }
+
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
 
 void ggml_vec_dot_q4_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
