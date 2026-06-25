@@ -7,17 +7,12 @@
 #include "quants.h"
 
 #include "arch-fallback.h"
-#include "kernel.h"
 
 #include <string.h>
 #include <assert.h>
 #include <float.h>
 #include <stdlib.h> // for qsort
 #include <stdio.h>  // for GGML_ASSERT
-
-#if defined(_MSC_VER)
-#  include <windows.h>
-#endif
 
 #define GROUP_MAX_EPS 1e-15f
 #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
@@ -27,122 +22,20 @@
 
 #define UNUSED GGML_UNUSED
 
-/* ---------------------------------------------------------------------------
- * Gyroscopic scale hook.
- *
- * The kernel AUTHORS the per-group magnitude; llama only APPLIES it. This is
- * the one and only insertion point: a thread-local gravity attenuation factor
- * that multiplies the Q1_0 FP16 scale at its single load site below.
- *
- * Default = 1.0f  -> bit-identical to stock Q1_0 (no behavioral change).
- * The caller (model-load glue) sets the factor per layer to exp(g1 * L/N)
- * via gyroscopic_set_gravity_factor(); the matmul arithmetic is unchanged.
- * Per-group sign analysis and route stats run ONLY when GGML_GYROSCOPIC_TRACE=1.
- * No custom matmul, no callback in the inner loop.
- * ------------------------------------------------------------------------- */
+/* Per-layer gravity factor for Q1_0 dot products (GGML_GYROSCOPIC=1). */
 #if defined(_MSC_VER)
 #  define GYRO_THREAD_LOCAL __declspec(thread)
 #else
 #  define GYRO_THREAD_LOCAL __thread
 #endif
 static GYRO_THREAD_LOCAL float g_gyroscopic_gravity_factor = 1.0f;
-static int g_gyroscopic_trace_enabled = -1;
-static uint64_t g_gyroscopic_path_count[GYROSCOPIC_PATH_COUNT];
-static uint64_t g_gyroscopic_group_count = 0;
 
 void gyroscopic_set_gravity_factor(float factor) {
     g_gyroscopic_gravity_factor = (factor > 0.0f) ? factor : 1.0f;
-    if (g_gyroscopic_trace_enabled < 0) {
-        const char * e = getenv("GGML_GYROSCOPIC_TRACE");
-        g_gyroscopic_trace_enabled = (e && e[0] == '1') ? 1 : 0;
-    }
 }
 
 float gyroscopic_get_gravity_factor(void) {
     return g_gyroscopic_gravity_factor;
-}
-
-void gyroscopic_reset_matmul_stats(void) {
-    memset(g_gyroscopic_path_count, 0, sizeof(g_gyroscopic_path_count));
-    g_gyroscopic_group_count = 0;
-}
-
-const gyroscopic_matmul_stats * gyroscopic_get_matmul_stats(void) {
-    static GYRO_THREAD_LOCAL gyroscopic_matmul_stats snapshot;
-    snapshot.groups = g_gyroscopic_group_count;
-    memcpy(snapshot.path_count, g_gyroscopic_path_count, sizeof(snapshot.path_count));
-    return &snapshot;
-}
-
-static int gyroscopic_trace_enabled_internal(void) {
-    if (g_gyroscopic_trace_enabled < 0) {
-        const char * e = getenv("GGML_GYROSCOPIC_TRACE");
-        g_gyroscopic_trace_enabled = (e && e[0] == '1') ? 1 : 0;
-    }
-    return g_gyroscopic_trace_enabled;
-}
-
-int gyroscopic_trace_enabled(void) {
-    return gyroscopic_trace_enabled_internal();
-}
-
-static void gyroscopic_record_route(uint8_t path) {
-#if defined(_MSC_VER)
-    InterlockedIncrement64((volatile LONG64 *) &g_gyroscopic_group_count);
-    if (path < GYROSCOPIC_PATH_COUNT) {
-        InterlockedIncrement64((volatile LONG64 *) &g_gyroscopic_path_count[path]);
-    }
-#else
-    __sync_fetch_and_add(&g_gyroscopic_group_count, 1);
-    if (path < GYROSCOPIC_PATH_COUNT) {
-        __sync_fetch_and_add(&g_gyroscopic_path_count[path], 1);
-    }
-#endif
-}
-
-void gyroscopic_maybe_log_matmul_stats(void) {
-    if (!gyroscopic_trace_enabled_internal()) {
-        return;
-    }
-    if (g_gyroscopic_group_count == 0) {
-        return;
-    }
-    fprintf(stderr,
-        "GYROSCOPIC: groups=%llu iso=%llu cs=%llu una=%llu ona=%llu bu=%llu depth=%.6f\n",
-        (unsigned long long) g_gyroscopic_group_count,
-        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_ISOTROPIC],
-        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_CS],
-        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_UNA],
-        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_ONA],
-        (unsigned long long) g_gyroscopic_path_count[GYROSCOPIC_PATH_BULK_BU],
-        (double) g_gyroscopic_gravity_factor);
-    fflush(stderr);
-}
-
-float gyroscopic_q1_group_scale(const block_q1_0 * block) {
-    const float depth = g_gyroscopic_gravity_factor;
-
-    if (block == NULL) {
-        return depth;
-    }
-
-    if (g_gyroscopic_trace_enabled == 1) {
-        gyroscopic_trace_q1_group(block);
-    }
-
-    return GYROSCOPIC_Q1_WEIGHT_D(block, depth);
-}
-
-void gyroscopic_trace_q1_group(const block_q1_0 * block) {
-    uint8_t shell = 0;
-    uint8_t k4 = 0;
-
-    if (block == NULL || g_gyroscopic_trace_enabled != 1) {
-        return;
-    }
-
-    gyroscopic_analyze_q1_group(block->qs, NULL, &shell, &k4);
-    gyroscopic_record_route(gyroscopic_route_path(shell, k4));
 }
 
 void quantize_row_q1_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
@@ -260,18 +153,11 @@ void ggml_vec_dot_q1_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
-
-    const float gyro_depth = gyroscopic_get_gravity_factor();
-    const int   gyro_trace = gyroscopic_trace_enabled_internal();
-
-    float sumf = 0.0;
+    const float g = gyroscopic_get_gravity_factor();
+    float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
-        if (gyro_trace) {
-            gyroscopic_trace_q1_group(&x[i]);
-        }
-        const float d0 = GYROSCOPIC_Q1_WEIGHT_D(&x[i], gyro_depth);
-
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d) * g;
         float sumi = 0.0f;
 
         for (int k = 0; k < 4; k++) {

@@ -15,8 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 
-/* Gyroscopic: kernel authors per-group scales; this file sets the per-layer
- * gravity factor that quants.c applies at the Q1_0 scale-load site. */
+/* Gyroscopic: per-layer gravity factor for quants.c Q1_0 scale hook. */
 #include "kernel.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -1248,21 +1247,32 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-/* ---------------------------------------------------------------------------
- * Gyroscopic per-layer gravity factor.
- *
- * Enabled only when GGML_GYROSCOPIC=1. For each Q1_0 weight tensor named
- * "blk.<L>.*", set the thread-local gravity factor to the depth attenuation
- * exp(g1 * L/N) authored by the kernel. quants.c multiplies the FP16 group
- * scale by this factor at its single load site. For any other tensor (or when
- * disabled) the factor is 1.0, so behavior is bit-identical to stock.
- * --------------------------------------------------------------------------- */
+/* Per-layer gravity factor (GGML_GYROSCOPIC=1, Q1_0 tensors named blk.<L>.*). */
+#define GYRO_LAYER_TABLE_MAX 128
+
+#if defined(_MSC_VER)
+#  define GYRO_CPU_TLS __declspec(thread)
+#else
+#  define GYRO_CPU_TLS __thread
+#endif
+
+static int gyro_enabled = -1;
+static int gyro_total_layers = GYROSCOPIC_DEFAULT_TOTAL_LAYERS;
+static float gyro_gravity_table[GYRO_LAYER_TABLE_MAX];
+
+static GYRO_CPU_TLS float gyro_applied_factor = 1.0f;
+
 static int gyroscopic_layer_from_name(const char * name) {
-    if (name == NULL) return -1;
-    const char * p = strstr(name, "blk.");
-    if (p == NULL) return -1;
-    p += 4;
-    if (*p < '0' || *p > '9') return -1;
+    if (name == NULL) {
+        return -1;
+    }
+    if (name[0] != 'b' || name[1] != 'l' || name[2] != 'k' || name[3] != '.') {
+        return -1;
+    }
+    const char * p = name + 4;
+    if (*p < '0' || *p > '9') {
+        return -1;
+    }
     int layer = 0;
     while (*p >= '0' && *p <= '9') {
         layer = layer * 10 + (*p - '0');
@@ -1271,34 +1281,65 @@ static int gyroscopic_layer_from_name(const char * name) {
     return layer;
 }
 
+static void gyroscopic_init_gravity_table(int total_layers, float * table) {
+    for (int layer = 0; layer < GYRO_LAYER_TABLE_MAX; ++layer) {
+        if (layer <= total_layers) {
+            table[layer] = gyroscopic_gravity_scale(layer, total_layers, 0, 0);
+        } else {
+            table[layer] = 1.0f;
+        }
+    }
+}
+
+static void gyroscopic_load_config(void) {
+    const char * e = getenv("GGML_GYROSCOPIC");
+    gyro_enabled = (e && e[0] == '1') ? 1 : 0;
+    const char * tl = getenv("GYROSCOPIC_TOTAL_LAYERS");
+    gyro_total_layers = (tl && tl[0]) ? atoi(tl) : GYROSCOPIC_DEFAULT_TOTAL_LAYERS;
+    if (gyro_total_layers < 1) {
+        gyro_total_layers = GYROSCOPIC_DEFAULT_TOTAL_LAYERS;
+    }
+    if (gyro_enabled) {
+        gyroscopic_init_gravity_table(gyro_total_layers, gyro_gravity_table);
+    }
+}
+
+#if defined(_WIN32)
+static BOOL WINAPI gyroscopic_init_once(PINIT_ONCE init_once, PVOID param, PVOID * context) {
+    (void) init_once;
+    (void) param;
+    (void) context;
+    gyroscopic_load_config();
+    return TRUE;
+}
+#endif
+
+static void gyroscopic_ensure_config(void) {
+#if defined(_WIN32)
+    static INIT_ONCE init_once = INIT_ONCE_STATIC_INIT;
+    InitOnceExecuteOnce(&init_once, gyroscopic_init_once, NULL, NULL);
+#else
+    if (gyro_enabled < 0) {
+        gyroscopic_load_config();
+    }
+#endif
+}
+
 static void gyroscopic_set_layer_factor(const struct ggml_tensor * src0) {
-    static int enabled = -1;
-    static int total_layers = 0;
-    static int cached_layer = -1;
-    static float cached_factor = 1.0f;
-    if (enabled < 0) {
-        const char * e = getenv("GGML_GYROSCOPIC");
-        enabled = (e && e[0] == '1') ? 1 : 0;
-        const char * tl = getenv("GYROSCOPIC_TOTAL_LAYERS");
-        total_layers = (tl && tl[0]) ? atoi(tl) : GYROSCOPIC_DEFAULT_TOTAL_LAYERS;
-        if (total_layers < 1) total_layers = GYROSCOPIC_DEFAULT_TOTAL_LAYERS;
-    }
-    if (!enabled || src0 == NULL || src0->type != GGML_TYPE_Q1_0) {
-        gyroscopic_set_gravity_factor(1.0f);
-        cached_layer = -1;
+    gyroscopic_ensure_config();
+    if (!gyro_enabled || src0 == NULL || src0->type != GGML_TYPE_Q1_0) {
         return;
     }
+
+    float factor = 1.0f;
     const int layer = gyroscopic_layer_from_name(src0->name);
-    if (layer < 0) {
-        gyroscopic_set_gravity_factor(1.0f);
-        cached_layer = -1;
-        return;
+    if (layer >= 0 && layer < GYRO_LAYER_TABLE_MAX) {
+        factor = gyro_gravity_table[layer];
     }
-    if (layer != cached_layer) {
-        cached_factor = gyroscopic_gravity_scale(layer, total_layers, 0, 0);
-        cached_layer = layer;
+    if (gyro_applied_factor != factor) {
+        gyroscopic_set_gravity_factor(factor);
+        gyro_applied_factor = factor;
     }
-    gyroscopic_set_gravity_factor(cached_factor);
 }
 
 void ggml_compute_forward_mul_mat(
@@ -1309,10 +1350,6 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src1 = dst->src[1];
 
     gyroscopic_set_layer_factor(src0);
-
-    if (params->ith == 0 && src0->type == GGML_TYPE_Q1_0 && gyroscopic_trace_enabled()) {
-        gyroscopic_reset_matmul_stats();
-    }
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1500,12 +1537,6 @@ UseGgmlGemm2:;
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
 
-    if (gyroscopic_trace_enabled()) {
-        ggml_barrier(params->threadpool);
-        if (params->ith == 0 && src0->type == GGML_TYPE_Q1_0) {
-            gyroscopic_maybe_log_matmul_stats();
-        }
-    }
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -1595,6 +1626,8 @@ static void ggml_compute_forward_mul_mat_id(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
     const struct ggml_tensor * ids = dst->src[2];
+
+    gyroscopic_set_layer_factor(src0);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

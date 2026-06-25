@@ -7,6 +7,7 @@
 
 #include "../../ggml-cpu-impl.h"
 #include "../../quants.h"
+#include "kernel.h"
 
 #include <math.h>
 #include <string.h>
@@ -284,6 +285,12 @@ static inline __m128i bytes_from_bits_16(const uint8_t * x) {
     bytes = _mm_or_si128(bytes, bit_mask);
 
     return _mm_cmpeq_epi8(bytes, _mm_set1_epi64x(-1));
+}
+
+static inline float hsum_float_4(const __m128 a) {
+    __m128 res = _mm_hadd_ps(a, a);
+    res = _mm_hadd_ps(res, res);
+    return _mm_cvtss_f32(res);
 }
 
 // horizontally add 4x4 floats
@@ -565,9 +572,7 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
-
-    const float gyro_depth = gyroscopic_get_gravity_factor();
-    const int   gyro_trace = gyroscopic_trace_enabled();
+    const float g = gyroscopic_get_gravity_factor();
 
 #if defined(__AVX2__)
     const __m256i ones_8 = _mm256_set1_epi8(1);
@@ -582,10 +587,7 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
-        if (gyro_trace) {
-            gyroscopic_trace_q1_group(&x[ib]);
-        }
-        const float d0 = GYROSCOPIC_Q1_WEIGHT_D(&x[ib], gyro_depth);
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d) * g;
         const uint32_t * GGML_RESTRICT qs32 = (const uint32_t *) x[ib].qs;
         const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
 
@@ -617,10 +619,7 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m256 acc = _mm256_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
-        if (gyro_trace) {
-            gyroscopic_trace_q1_group(&x[ib]);
-        }
-        const float d0 = GYROSCOPIC_Q1_WEIGHT_D(&x[ib], gyro_depth);
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[ib].d) * g;
         const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
         __m256 acc_block;
         {
@@ -673,11 +672,7 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     __m128 acc_3 = _mm_setzero_ps();
 
     for (int ib = 0; ib < nb; ++ib) {
-        if (gyro_trace) {
-            gyroscopic_trace_q1_group(&x[ib]);
-        }
-        const float d0f = GYROSCOPIC_Q1_WEIGHT_D(&x[ib], gyro_depth);
-        const __m128 d0 = _mm_set1_ps(d0f);
+        const __m128 d0 = _mm_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * g);
         const block_q8_0 * GGML_RESTRICT y_ptr = &y[ib * 4];
 
 #define Q1_SSSE3_BLOCK(QS_OFF, Y_IDX, ACC) \

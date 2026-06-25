@@ -150,12 +150,13 @@ void ggml_vec_dot_q1_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
     const block_q1_0 * GGML_RESTRICT x = vx;
     const block_q8_0 * GGML_RESTRICT y = vy;
+    const float g = gyroscopic_get_gravity_factor();
 
 #if defined(__ARM_NEON)
     float32x4_t sumv = vdupq_n_f32(0.0f);
 
     for (int i = 0; i < nb; i++) {
-        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d) * g;
 
         // Process 4 Q8_0 blocks (each has 32 elements)
         for (int k = 0; k < 4; k++) {
