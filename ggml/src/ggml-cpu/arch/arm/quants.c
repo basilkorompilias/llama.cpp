@@ -253,8 +253,9 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     for (int i = 0; i < nb; i++) {
         const float d0 = GGML_CPU_FP16_TO_FP32(x[i].d);
 
-        for (int k = 0; k < 4; k++) {
-            const block_q8_0 * GGML_RESTRICT yb = &y[i * 4 + k];
+        // group 64: one Q2_0 block (64 weights) maps to two Q8_0 blocks (2 * 32 = 64)
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i * 2 + k];
             const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
 
             // Load 8 bytes of packed 2-bit values
@@ -262,13 +263,13 @@ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
             const uint8x16_t raw16 = vcombine_u8(raw, raw);
 
             // First 16 elements: replicate bytes 0-3, shift, mask, subtract 1
-            uint8x16_t bytes0 = vqtbl1q_u8(raw16, idx_lo);
+            uint8x16_t bytes0 = ggml_vqtbl1q_u8(raw16, idx_lo);
             int8x16_t qv0 = vsubq_s8(
                 vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes0, shifts), mask2)),
                 one);
 
             // Second 16 elements: replicate bytes 4-7, shift, mask, subtract 1
-            uint8x16_t bytes1 = vqtbl1q_u8(raw16, idx_hi);
+            uint8x16_t bytes1 = ggml_vqtbl1q_u8(raw16, idx_hi);
             int8x16_t qv1 = vsubq_s8(
                 vreinterpretq_s8_u8(vandq_u8(vshlq_u8(bytes1, shifts), mask2)),
                 one);
@@ -885,10 +886,10 @@ void ggml_vec_dot_nvfp4_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const vo
         const float dy0 = GGML_CPU_FP16_TO_FP32(y[2*ib].d);
         const float dy1 = GGML_CPU_FP16_TO_FP32(y[2*ib+1].d);
         const float32x4_t nvsc = {
-            ggml_ue4m3_to_fp32(x[ib].d[0]),
-            ggml_ue4m3_to_fp32(x[ib].d[1]),
-            ggml_ue4m3_to_fp32(x[ib].d[2]),
-            ggml_ue4m3_to_fp32(x[ib].d[3])
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[0]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[1]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[2]),
+            GGML_CPU_UE4M3_TO_FP32(x[ib].d[3])
         };
         const float32x4_t scales = vmulq_f32(nvsc, (float32x4_t){dy0, dy0, dy1, dy1});
 

@@ -189,8 +189,6 @@ if (GGML_BACKEND_DL AND NOT BUILD_SHARED_LIBS)
     message(FATAL_ERROR "GGML_BACKEND_DL requires BUILD_SHARED_LIBS")
 endif()
 
-option(GGML_GYROSCOPIC "ggml: gyroscopic CPU backend (kernel gravity scale hook)" OFF)
-
 add_library(ggml-base
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -216,27 +214,29 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
-if (GGML_GYROSCOPIC)
-    # Gyroscopic backend = vanilla ggml-cpu duplicate (ggml-gyroscopic/) plus the
-    # self-contained per-group scale hook in ggml-gyroscopic/quants.c. The kernel
-    # (src/tools/gyroscopic/kernel.c) is compiled into the backend via the
-    # ggml-gyroscopic CMakeLists so the hook can author scales from CGM constants.
-    # ggml-base itself needs no extra sources; the backend subdir does the work.
-    target_compile_definitions(ggml-base PUBLIC GGML_USE_GYROSCOPIC=1)
-    if (GGML_OPENMP)
-        find_package(OpenMP)
-        if (OpenMP_FOUND)
-            target_compile_options(ggml-base PRIVATE $<TARGET_PROPERTY:OpenMP::OpenMP_C,INTERFACE_COMPILE_OPTIONS>)
-            target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C)
-        endif()
-    endif()
-endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
 
 if (GGML_SCHED_NO_REALLOC)
     target_compile_definitions(ggml-base PUBLIC GGML_SCHED_NO_REALLOC)
+endif()
+
+if (GGML_OPENMP)
+    find_package(OpenMP)
+    if (OpenMP_FOUND)
+        set(GGML_OPENMP_ENABLED "ON" CACHE INTERNAL "")
+    else()
+        set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+        message(WARNING "OpenMP not found")
+    endif()
+else()
+    set(GGML_OPENMP_ENABLED "OFF" CACHE INTERNAL "")
+endif()
+
+if (GGML_OPENMP_ENABLED)
+    target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
+    target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
 endif()
 
 add_library(ggml
@@ -309,16 +309,10 @@ function(ggml_add_backend_library backend)
     endif()
 endfunction()
 
-set(GGML_CPU_BACKEND_SUBDIR "ggml-cpu" CACHE STRING "ggml: CPU backend under ggml/src (ggml-cpu or ggml-gyroscopic)")
-
 function(ggml_add_backend backend)
     string(TOUPPER "GGML_${backend}" backend_id)
     if (${backend_id})
-        if (backend STREQUAL "CPU")
-            set(backend_target ${GGML_CPU_BACKEND_SUBDIR})
-        else()
-            string(TOLOWER "ggml-${backend}" backend_target)
-        endif()
+        string(TOLOWER "ggml-${backend}" backend_target)
         add_subdirectory(${backend_target})
         message(STATUS "Including ${backend} backend")
         if (NOT GGML_BACKEND_DL)
@@ -444,7 +438,14 @@ if (GGML_CPU_ALL_VARIANTS)
             ggml_add_cpu_backend_variant(power8_2       POWER8  VSX)
             ggml_add_cpu_backend_variant(power9         POWER9  VSX)
             ggml_add_cpu_backend_variant(power10        POWER10 VSX)
-            ggml_add_cpu_backend_variant(power11        POWER11 VSX)
+            # POWER11 backend: only if compiler supports -mcpu=power11
+            check_cxx_compiler_flag("-mcpu=power11" GGML_CXX_SUPPORTS_POWER11)
+            if (GGML_CXX_SUPPORTS_POWER11)
+                message(STATUS "Compiler supports -mcpu=power11, enabling POWER11 backend")
+                ggml_add_cpu_backend_variant(power11 POWER11 VSX)
+            else()
+                message(STATUS "Skipping POWER11 backend: compiler does not support -mcpu=power11")
+            endif()
         else()
             message(FATAL_ERROR "Unsupported PowerPC target OS: ${CMAKE_SYSTEM_NAME}")
         endif()
@@ -472,6 +473,7 @@ endif()
 ggml_add_backend(BLAS)
 ggml_add_backend(CANN)
 ggml_add_backend(CUDA)
+ggml_add_backend(ET)
 ggml_add_backend(HIP)
 ggml_add_backend(METAL)
 ggml_add_backend(MUSA)
@@ -493,11 +495,10 @@ endforeach()
 
 target_link_libraries(ggml-base PRIVATE Threads::Threads)
 
-find_library(MATH_LIBRARY m)
-if (MATH_LIBRARY)
-    if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
-        target_link_libraries(ggml-base PRIVATE m)
-    endif()
+if (DEFINED MATH_LIBRARY)
+    target_link_libraries(ggml-base PRIVATE ${MATH_LIBRARY})
+elseif (NOT WIN32 AND NOT DEFINED ENV{ONEAPI_ROOT})
+    target_link_libraries(ggml-base PRIVATE m)
 endif()
 
 if (CMAKE_SYSTEM_NAME MATCHES "Android")

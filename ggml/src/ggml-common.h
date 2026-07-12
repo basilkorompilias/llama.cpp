@@ -184,7 +184,7 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
-#define QK2_0 128
+#define QK2_0 64
 typedef struct {
     ggml_half d;              // delta (scale)
     uint8_t qs[QK2_0 / 4];   // 2 bits per element
@@ -1121,11 +1121,12 @@ GGML_TABLE_BEGIN(int8_t, kvalues_iq4nl, 16)
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 GGML_TABLE_END()
 
-// e2m1 values (doubled)
+// e2m1 values (doubled), shared by MXFP4 and NVFP4
 // ref: https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf
-GGML_TABLE_BEGIN(int8_t, kvalues_mxfp4, 16)
+GGML_TABLE_BEGIN(int8_t, kvalues_fp4, 16)
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,
 GGML_TABLE_END()
+#define kvalues_mxfp4 kvalues_fp4
 
 #define NGRID_IQ1S 2048
 #define IQ1S_DELTA 0.125f
