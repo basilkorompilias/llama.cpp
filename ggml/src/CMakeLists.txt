@@ -312,9 +312,13 @@ endfunction()
 function(ggml_add_backend backend)
     string(TOUPPER "GGML_${backend}" backend_id)
     if (${backend_id})
-        string(TOLOWER "ggml-${backend}" backend_target)
+        if (backend STREQUAL "CPU" AND DEFINED GGML_CPU_BACKEND_SUBDIR)
+            string(TOLOWER "${GGML_CPU_BACKEND_SUBDIR}" backend_target)
+        else()
+            string(TOLOWER "ggml-${backend}" backend_target)
+        endif()
         add_subdirectory(${backend_target})
-        message(STATUS "Including ${backend} backend")
+        message(STATUS "Including ${backend} backend (${backend_target})")
         if (NOT GGML_BACKEND_DL)
             string(TOUPPER "GGML_USE_${backend}" backend_use)
             target_compile_definitions(ggml PUBLIC ${backend_use})
@@ -365,6 +369,13 @@ function(ggml_add_cpu_backend_variant tag_name)
 
     ggml_add_cpu_backend_variant_impl(${tag_name})
 endfunction()
+
+# Gyroscopic hook: when GGML_GYROSCOPIC=ON, build the ggml-gyroscopic backend
+# (vanilla ggml-cpu copy with thin hooks) instead of the stock ggml-cpu.
+if (GGML_GYROSCOPIC)
+    set(GGML_CPU_BACKEND_SUBDIR "ggml-gyroscopic")
+    message(STATUS "Gyroscopic backend enabled: building ggml-gyroscopic")
+endif()
 
 ggml_add_backend(CPU)
 

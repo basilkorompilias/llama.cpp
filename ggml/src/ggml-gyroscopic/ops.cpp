@@ -7,10 +7,17 @@
 #include "ggml.h"
 #include "unary-ops.h"
 #include "vec.h"
+#include "attn.h"
+#include "codec.h"
+#include "kernel.h"
+#include "layer.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 // ggml_compute_forward_dup
 
@@ -656,6 +663,43 @@ void ggml_compute_forward_add(
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    /* Residual-stream law: only same-shape F32 4096-dim residual adds.
+     * y = src0 + gain*src1 with gain = 1+Delta*m from lift traj. */
+    static int s_hyb = -1;
+    if (s_hyb < 0) {
+        s_hyb = hqvm_residual_law_enabled() ? 1 : 0;
+    }
+    if (s_hyb && src0 && src1 &&
+        src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[0] == 4096 && src1->ne[0] == 4096 && dst->ne[0] == 4096 &&
+        ggml_are_same_shape(src0, src1) && ggml_are_same_shape(src0, dst) &&
+        src0->nb[0] == sizeof(float) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const float gain = hqvm_residual_gain();
+        const int ith = params->ith;
+        const int nth = params->nth;
+        const int64_t nr = ggml_nrows(dst);
+        const int64_t dr = (nr + nth - 1) / nth;
+        const int64_t r0 = dr * ith;
+        const int64_t r1 = MIN(r0 + dr, nr);
+        if (ith == 0) {
+            hqvm_residual_law_hit();
+        }
+        for (int64_t ir = r0; ir < r1; ++ir) {
+            const float * x0 = (const float *)((const char *)src0->data + ir * src0->nb[1]);
+            const float * x1 = (const float *)((const char *)src1->data + ir * src1->nb[1]);
+            float * y = (float *)((char *)dst->data + ir * dst->nb[1]);
+            for (int64_t i = 0; i < 4096; ++i) {
+                y[i] = x0[i] + x1[i] * gain;
+            }
+        }
+        ggml_barrier(params->threadpool);
+        if (params->ith == 0 && dst->data && dst->type == GGML_TYPE_F32) {
+            hqvm_residual_shadow_log((const float *)dst->data, dst->ne[0], 0);
+        }
+        return;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32:
@@ -696,6 +740,11 @@ void ggml_compute_forward_add(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    /* Arc 4C residual shadow — measurement in gyroscopic. */
+    if (params->ith == 0 && dst->data && dst->type == GGML_TYPE_F32) {
+        hqvm_residual_shadow_log((const float *)dst->data, dst->ne[0], 0);
     }
 }
 
@@ -2615,6 +2664,12 @@ static void ggml_compute_forward_silu_f32(
         ggml_vec_silu_f32(nc,
                 (float *) ((char *) dst->data  + i3*nb3  + i2*nb2  + i1*nb1),
                 (float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01));
+        if (hqvm_silu_codec_enabled() && params->ith == 0) {
+            /* Measurement only on plain SiLU; Bonsai FFN is SwiGLU. */
+            hqvm_silu_codec_shadow(
+                (const float *) ((char *) src0->data + i3*nb03 + i2*nb02 + i1*nb01),
+                nc, 16.0f);
+        }
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
@@ -2694,6 +2749,10 @@ static void ggml_compute_forward_silu(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    if (hqvm_silu_codec_enabled() && src0->data && src0->type == GGML_TYPE_F32 && params->ith == 0) {
+        hqvm_silu_codec_shadow((const float *)src0->data, src0->ne[0], 10.0f);
     }
 }
 // ggml_compute_forward_leaky_relu
@@ -3225,7 +3284,26 @@ static void ggml_compute_forward_swiglu_f32(
             src1_p += swapped ? 0 : nc;
         }
 
-        ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+        if (hqvm_ffn_shell_gate_enabled()) {
+            const uint8_t fam = hqvm_cgm_lift_enabled() ? hqvm_cgm_lift_fam() : 0;
+            const uint8_t Nc = hqvm_cgm_lift_enabled() ? hqvm_cgm_lift_carrier_shell() : 3;
+            hqvm_ffn_shell_gate_apply(
+                (float *) ((char *) dst->data + i1*(dst->nb[1])),
+                src0_p, src1_p, nc, fam, Nc);
+        } else if (hqvm_silu_codec_enabled()) {
+            if (params->ith == 0) {
+                /* clip=16 covers measured maxabs~8; 64 was a provisional ceiling. */
+                hqvm_swiglu_codec_shadow(src0_p, src1_p, nc, 16.0f);
+            }
+            /* Owned site: GYRO_SILU_CODEC=1 applies the LUT (no separate COMMIT flag). */
+            hqvm_swiglu_apply(
+                (float *) ((char *) dst->data + i1*(dst->nb[1])),
+                src0_p, src1_p, nc, 16.0f);
+            hqvm_stock_silu_inc();
+        } else {
+            ggml_vec_swiglu_f32(nc, (float *) ((char *) dst->data + i1*(dst->nb[1])), src0_p, src1_p);
+            hqvm_stock_silu_inc();
+        }
 
 #ifndef NDEBUG
         for (int k = 0; k < nc; k++) {
@@ -3832,7 +3910,13 @@ static void ggml_compute_forward_rms_norm_f32(
                 }
 
                 const float mean  = sum/ne00;
-                const float scale = 1.0f/sqrtf(mean + eps);
+                float scale;
+                if (hqvm_norm_commit_enabled()) {
+                    scale = hqvm_rms_gain_fixed(x, ne00, eps);
+                    if (scale <= 0.0f) scale = 1.0f/sqrtf(mean + eps);
+                } else {
+                    scale = 1.0f/sqrtf(mean + eps);
+                }
 
                 // if you hit this, likely you got an inf somewhere earlier
                 assert(scale > 0.0f);
@@ -3843,10 +3927,56 @@ static void ggml_compute_forward_rms_norm_f32(
                     const int64_t i11 = i01 % ne11;
                     const int64_t i12 = i02 % ne12;
                     const int64_t i13 = i03 % ne13;
-                    const float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+                    float * w = (float *) ((char *) src1->data + i11*nb11 + i12*nb12 + i13*nb13);
+
+                    /* Export g0 from Norm weight geomean once; optional channel ruler. */
+                    if (hqvm_norm_commit_enabled() && params->ith == 0 && i01 == 0 && i02 == 0 && i03 == 0) {
+                        hqvm_norm_set_g0_from_gains(w, ne00);
+                        /* Register Norm gains into native block weight table. */
+                        if (src1 && src1->name) {
+                            const char *nm = src1->name;
+                            const char *p = strstr(nm, "blk.");
+                            if (p) {
+                                const int il = atoi(p + 4);
+                                if (il >= 0 && il < HQVM_N_LAYER) {
+                                    hqvm_block_weights_t wcur;
+                                    const hqvm_block_weights_t *prev = hqvm_block_get_weights(il);
+                                    if (prev) wcur = *prev;
+                                    else memset(&wcur, 0, sizeof(wcur));
+                                    if (strstr(nm, "attn_norm")) {
+                                        wcur.attn_norm_g = w;
+                                        wcur.attn_norm_g0 = hqvm_norm_g0();
+                                    } else if (strstr(nm, "ffn_norm")) {
+                                        wcur.ffn_norm_g = w;
+                                        wcur.ffn_norm_g0 = hqvm_norm_g0();
+                                    }
+                                    hqvm_block_register_weights(il, &wcur);
+                                }
+                            }
+                        }
+                    }
 
                     for (int64_t i00 = 0; i00 < ne00; i00++) {
-                        y[i00] = x[i00] * scale * w[i00];
+                        float wi = w[i00];
+                        if (hqvm_norm_commit_enabled()) {
+                            const float g0 = hqvm_norm_g0();
+                            const float gi = fabsf(wi);
+                            const int16_t n16 = hqvm_norm_encode_gain16(
+                                gi > 0.0f ? gi : g0, g0, (float)APERTURE_GAP);
+                            const float gh = hqvm_norm_decode_gain16(n16, g0, (float)APERTURE_GAP);
+                            wi = (wi < 0.0f) ? -gh : gh;
+                        }
+                        y[i00] = x[i00] * scale * wi;
+                    }
+                    /* Also tick-quantize the RMS scale itself. */
+                    if (hqvm_norm_commit_enabled() && scale > 0.0f) {
+                        const float g0 = hqvm_norm_g0();
+                        const int16_t n16 = hqvm_norm_encode_gain16(scale, g0, (float)APERTURE_GAP);
+                        const float g_hat = hqvm_norm_decode_gain16(n16, g0, (float)APERTURE_GAP);
+                        const float rescale = g_hat / scale;
+                        for (int64_t i00 = 0; i00 < ne00; i00++) {
+                            y[i00] *= rescale;
+                        }
                     }
                 } else {
                     memcpy(y, x, ne00 * sizeof(float));
@@ -3863,6 +3993,7 @@ void ggml_compute_forward_rms_norm(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    /* Arc 4D shell shadow lives in the fused rms_norm_mul path (what Bonsai runs). */
     switch (src0->type) {
         case GGML_TYPE_F32:
             {
@@ -3896,6 +4027,16 @@ void ggml_compute_forward_rms_norm_mul_fused(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    /* Arc 4D shell-norm shadow — measurement in gyroscopic. */
+    if (params->ith == 0 && src0->type == GGML_TYPE_F32 && src0->data) {
+        hqvm_shell_norm_shadow_log((const float *)src0->data, src0->ne[0]);
+        if (hqvm_norm_codec_enabled()) {
+            float eps = 1e-5f;
+            memcpy(&eps, dst_rms_norm->op_params, sizeof(float));
+            hqvm_norm_codec_shadow((const float *)src0->data, src0->ne[0], eps, (float)APERTURE_GAP);
+        }
     }
 }
 
@@ -5006,23 +5147,12 @@ void ggml_compute_forward_get_rows(
             }
     }
 
-    //static bool first = true;
-    //printf("ne0 = %d, ne1 = %d, ne2 = %d\n", dst->ne[0], dst->ne[1], dst->ne[2]);
-    //if (first) {
-    //    first = false;
-    //} else {
-    //    for (int k = 0; k < dst->ne[1]; ++k) {
-    //        for (int j = 0; j < dst->ne[0]/16; ++j) {
-    //            for (int i = 0; i < 16; ++i) {
-    //                printf("%8.4f ", ((float *) dst->data)[k*dst->ne[0] + j*16 + i]);
-    //            }
-    //            printf("\n");
-    //        }
-    //        printf("\n");
-    //    }
-    //    printf("\n");
-    //    exit(0);
-    //}
+    /* Embd Pi: stash first row signs → (u6,v6) for request CS anchor. */
+    if (params->ith == 0 && src0 && src0->name && dst && dst->data &&
+        dst->type == GGML_TYPE_F32 && dst->ne[0] >= 12 &&
+        strstr(src0->name, "token_embd") != NULL) {
+        hqvm_pi_stash_from_embd_row((const float *)dst->data, dst->ne[0]);
+    }
 }
 
 template<typename src_t, typename idx_t>
@@ -5087,9 +5217,57 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
+/* CGM-lift side-channel: after stock set_rows wrote Q8_0, store chi6 from the
+ * still-available float/F16 source row. Does not change quantization math. */
+static void hqvm_chi6_store_after_set_rows_q8(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int64_t ne0 = dst->ne[0];
+    const int64_t nb = ggml_nrows(src1);
+    static int s_q8_path_note = 0;
+    if (params->ith != 0) return;
+    if (!dst->name || strncmp(dst->name, "cache_k", 7) != 0) return;
+    if (dst->type != GGML_TYPE_Q8_0) return;
+    if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) return;
+    if (s_q8_path_note < 2) {
+        fprintf(stderr, "[hqvm-cgm-lift] set_rows Q8 chi6 src0=%s nb=%lld ne0=%lld\n",
+            ggml_type_name(src0->type), (long long)nb, (long long)ne0);
+        s_q8_path_note++;
+    }
+    const int64_t n_heads = (ne0 >= 128) ? (ne0 / 128) : 1;
+    for (int64_t r = 0; r < nb; ++r) {
+        int64_t idx;
+        if (src1->type == GGML_TYPE_I64) idx = ((const int64_t *) src1->data)[r];
+        else idx = (int64_t)((const int32_t *) src1->data)[r];
+        const char * row_base = (const char *)src0->data + r * src0->nb[1];
+        if (src0->type == GGML_TYPE_F32) {
+            hqvm_k_chi6_store(dst->data, idx, (const float *)row_base, n_heads, 128);
+        } else {
+            /* F16: dequant only first 64 floats per head (chi6 uses signs of those). */
+            float packed[HQVM_KV_N_KV_HEAD * 128];
+            if (n_heads > HQVM_KV_N_KV_HEAD) continue;
+            for (int64_t h = 0; h < n_heads; ++h) {
+                const ggml_fp16_t * in_h =
+                    (const ggml_fp16_t *)(row_base + (size_t)h * 128 * sizeof(ggml_fp16_t));
+                for (int i = 0; i < 64; ++i) {
+                    packed[h * 128 + i] = GGML_FP16_TO_FP32(in_h[i]);
+                }
+            }
+            hqvm_k_chi6_store(dst->data, idx, packed, n_heads, 128);
+        }
+    }
+}
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+
+    /* Native driver owns its own K/V/chi cache; stock set_rows is dead under bypass. */
+    if (hqvm_native_bypass_active()) {
+        return;
+    }
 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -5104,6 +5282,10 @@ void ggml_compute_forward_set_rows(
                 } else {
                     GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
                 }
+                /* Side-store chi6 after stock F32→Q8 quantize (magnitude path unchanged). */
+                if (dst->type == GGML_TYPE_Q8_0) {
+                    hqvm_chi6_store_after_set_rows_q8(params, dst);
+                }
             } break;
         case GGML_TYPE_F16:
             {
@@ -5115,6 +5297,28 @@ void ggml_compute_forward_set_rows(
                     } else {
                         GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
                     }
+                } else if (dst->type == GGML_TYPE_Q8_0) {
+                    /* Arc 2B-2/3C: quantize F16 K/V rows into Q8_0 cache (attn). */
+                    const int64_t ne0 = dst->ne[0];
+                    const int64_t nb = ggml_nrows(src1);
+                    if (params->ith != 0) { ggml_barrier(params->threadpool); return; }
+                    for (int64_t r = 0; r < nb; ++r) {
+                        int64_t idx;
+                        if (src1->type == GGML_TYPE_I64) idx = ((const int64_t *) src1->data)[r];
+                        else idx = (int64_t)((const int32_t *) src1->data)[r];
+                        float row[4096];
+                        if (ne0 > 4096) GGML_ABORT("q8 set_rows ne0 too large");
+                        for (int64_t d = 0; d < ne0; ++d) {
+                            row[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *)((const char *) src0->data + r * src0->nb[1]))[d]);
+                        }
+                        char * out = (char *) dst->data + idx * dst->nb[1];
+                        hqvm_quantize_row_q8(row, ne0, out);
+                        if (dst->name && strncmp(dst->name, "cache_k", 7) == 0) {
+                            const int64_t n_heads = (ne0 >= 128) ? (ne0 / 128) : 1;
+                            hqvm_k_chi6_store(dst->data, idx, row, n_heads, 128);
+                        }
+                    }
+                    ggml_barrier(params->threadpool);
                 } else {
                     GGML_ABORT("dst->type = %d (%s) not supported with src0->type = %d (%s)", dst->type, ggml_type_name(dst->type), src0->type, ggml_type_name(src0->type));
                 }
@@ -5981,6 +6185,19 @@ static void ggml_compute_forward_rope_flt(
                     if (!mrope_used) {
                         const int64_t p = pos[i2];
                         ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                        /* GyroClock / RoPE bind audit at layer 0: pos should match lift token_pos. */
+                        if (hqvm_cgm_lift_enabled() && hqvm_cgm_lift_layer() == 0 && params->ith == 0) {
+                            static int s_rope_clock_note = 0;
+                            const uint32_t clock_tok = hqvm_rope_clock_token_pos_get();
+                            if (s_rope_clock_note < 8) {
+                                fprintf(stderr,
+                                    "[hqvm-rope-clock] rope_pos=%lld clock_token_pos=%u layer=%d %s\n",
+                                    (long long)p, (unsigned)clock_tok, hqvm_cgm_lift_layer(),
+                                    ((uint32_t)p == clock_tok) ? "MATCH" : "MISMATCH");
+                                fflush(stderr);
+                                s_rope_clock_note++;
+                            }
+                        }
                     }
                     else {
                         const int64_t p_t = pos[i2];
@@ -6000,12 +6217,44 @@ static void ggml_compute_forward_rope_flt(
 
                 switch (mode) {
                     case GGML_ROPE_TYPE_NORMAL:
-                        rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
+                        if (hqvm_rope_codec_enabled() && dst->type == GGML_TYPE_F32) {
+                            uint8_t ticks[512];
+                            const int64_t p = !mrope_used ? pos[i2] : pos[i2];
+                            static int s_dth = 0;
+                            if (!s_dth) {
+                                hqvm_rope_init_dtheta(n_dims, theta_scale, freq_scale, freq_factors);
+                                s_dth = 1;
+                            }
+                            hqvm_rope_ticks_from_pos(p, n_dims, ticks);
+                            hqvm_rope_apply_row((const float *)src, (float *)dst_data, ticks, n_dims, 1, 0, sin_sign);
+                        } else {
+                            hqvm_rope_stock_inc();
+                            rotate_pairs<T>(n_dims, 1, cache, src, dst_data, 1);
+                        }
                         break;
                     case GGML_ROPE_TYPE_NEOX:
                     case GGML_ROPE_TYPE_MROPE:
                     case GGML_ROPE_TYPE_IMROPE:
-                        rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data);
+                        if (hqvm_rope_codec_enabled() && dst->type == GGML_TYPE_F32) {
+                            uint8_t ticks[512];
+                            const int64_t p = pos[i2];
+                            static int s_dth2 = 0;
+                            if (!s_dth2) {
+                                hqvm_rope_init_dtheta(n_dims, theta_scale, freq_scale, freq_factors);
+                                s_dth2 = 1;
+                            }
+                            hqvm_rope_ticks_from_pos(p, n_dims, ticks);
+                            /* Audit: LUT vs stock cache sin/cos (must be nonzero if codec active). */
+                            if (params->ith == 0) {
+                                hqvm_rope_codec_shadow(
+                                    (const float *)src, (const float *)src,
+                                    cache, n_dims, n_dims/2, 1, sin_sign);
+                            }
+                            hqvm_rope_apply_row((const float *)src, (float *)dst_data, ticks, n_dims, n_dims/2, 1, sin_sign);
+                        } else {
+                            hqvm_rope_stock_inc();
+                            rotate_pairs<T>(n_dims, n_dims/2, cache, src, dst_data);
+                        }
                         break;
                     case GGML_ROPE_TYPE_VISION:
                         rotate_pairs<T>(ne0, n_dims, cache, src, dst_data);
@@ -6048,6 +6297,31 @@ void ggml_compute_forward_rope(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    if (params->ith == 0 && hqvm_rope_codec_enabled()) {
+        static int s_rope_rep = 0;
+        s_rope_rep++;
+        if (s_rope_rep == 1 || (s_rope_rep % 36) == 0) {
+            hqvm_rope_codec_audit_report();
+        }
+    }
+
+    /* Phase 3/6: coordinate capture — numeric RoPE output unchanged.
+     * GYRO_KV_LEDGER=1 → WHT-peak chi6 + L2 on first 64 of dst (Gate A project-only). */
+    if (params->ith == 0 && hqvm_kv_ledger_enabled() && dst->type == GGML_TYPE_F32 && dst->data) {
+        const int64_t n = ggml_nelements(dst);
+        static uint32_t s_tok = 0;
+        hqvm_kv_ledger *L = hqvm_kv_ledger_global();
+        if (hqvm_kv_ledger_append_f32(L, s_tok++, (const float *)dst->data, n) == 0) {
+            const uint32_t c = hqvm_kv_ledger_count(L);
+            const uint32_t cc = hqvm_kv_ledger_coord_count(L);
+            if (c == 1u || (c % 64u) == 0u) {
+                fprintf(stderr, "[hqvm-kv] records=%u coords=%u (WHT-peak)\n",
+                        (unsigned)c, (unsigned)cc);
+                fflush(stderr);
+            }
+        }
     }
 }
 
@@ -8413,6 +8687,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * carrier = dst->src[5];
+    const ggml_tensor * q_kv_idxs = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8478,6 +8754,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t   const k_to_float     = ggml_get_type_traits(k->type)->to_float;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
@@ -8647,6 +8924,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * carrier = dst->src[5];
+    const ggml_tensor * q_kv_idxs = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -9134,9 +9413,421 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     }
 }
 
+/* Arc 2B-2: holonomic QK scores from Q8_0 K cache in-place + stock softmax @ V.
+ * Requires K cache type GGML_TYPE_Q8_0 (set GYRO_KV_KQ8=1 → type_k=Q8_0).
+ * MODE=dot/zero/random: perturbation diagnostics on the same displaced path. */
+static bool ggml_compute_forward_flash_attn_holonomic(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!q || !k || !v || !dst->data) return false;
+    if (q->type != GGML_TYPE_F16 && q->type != GGML_TYPE_F32) return false;
+    if (k->type != GGML_TYPE_Q8_0) {
+        /* No-fallback (Arc-2 analogue of GYRO_LEDGER_STRICT): if the user asked for
+         * displaced K cache but this tensor is not Q8_0, abort instead of silently
+         * scoring from float K. */
+        if (hqvm_kv_keys_enabled()) {
+            GGML_ABORT("GYRO_KV_KQ8=1 but flash_attn K is not Q8_0 (type=%d) — refusing float-K fallback", (int)k->type);
+        }
+        return false;
+    }
+    const char * v_flag = getenv("GYRO_KV_V");
+    const bool v_q8_required = v_flag && v_flag[0] && v_flag[0] != '0';
+    if (v->type == GGML_TYPE_Q8_0) {
+        /* Arc 3D: V read from displaced Q8_0 V cache — required layout. */
+    } else if (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32) {
+        if (v_q8_required) {
+            GGML_ABORT("GYRO_KV_V=1 but flash_attn V is not Q8_0 (type=%d) — refusing float-V fallback", (int)v->type);
+        }
+    } else {
+        return false;
+    }
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t Nq = neq1;
+    const int64_t Nk = nek1;
+    if (DK != 128 || DV <= 0 || Nq <= 0 || Nk <= 0) return false;
+    if (ne0 != DV) return false;
+
+    const int64_t rk2 = neq2 / nek2;
+    if (rk2 <= 0) return false;
+
+    float scale = 1.0f;
+    memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+
+    unsigned rnd_seed = 1u;
+    const int mode = hqvm_holonomic_attn_mode(&rnd_seed);
+    unsigned rnd = rnd_seed ^ (unsigned)(params->ith * 0x9E3779B9u);
+
+    hqvm_kv_ledger *L = hqvm_kv_ledger_global();
+    (void)L;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    /* Per-thread scratch grown once as Nk grows (no per-row malloc). */
+    enum { HQVM_FA_MAX_DV = 256 };
+    if (DV > HQVM_FA_MAX_DV) {
+        if (hqvm_kv_keys_enabled()) {
+            GGML_ABORT("GYRO_KV_KQ8=1 but flash_attn DV=%lld exceeds scratch — refusing stock fallback", (long long)DV);
+        }
+        return false;
+    }
+#if defined(_MSC_VER)
+    __declspec(thread) static float * tl_scores = NULL;
+    __declspec(thread) static float * tl_vkq = NULL;
+    __declspec(thread) static int64_t tl_scores_cap = 0;
+#else
+    static __thread float * tl_scores = NULL;
+    static __thread float * tl_vkq = NULL;
+    static __thread int64_t tl_scores_cap = 0;
+#endif
+    if (!tl_vkq) {
+        tl_vkq = (float *) malloc((size_t)HQVM_FA_MAX_DV * sizeof(float));
+        if (!tl_vkq) {
+            if (hqvm_kv_keys_enabled()) {
+                GGML_ABORT("GYRO_KV_KQ8=1 but VKQ scratch alloc failed — refusing stock fallback");
+            }
+            return false;
+        }
+    }
+    if (Nk > tl_scores_cap) {
+        float * grown = (float *) realloc(tl_scores, (size_t)Nk * sizeof(float));
+        if (!grown) {
+            if (hqvm_kv_keys_enabled()) {
+                GGML_ABORT("GYRO_KV_KQ8=1 but score scratch realloc(Nk=%lld) failed — refusing stock fallback", (long long)Nk);
+            }
+            return false;
+        }
+        tl_scores = grown;
+        tl_scores_cap = Nk;
+    }
+
+    const int64_t nr = neq1 * neq2 * neq3;
+    const int64_t dr = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+    int lifted_any = 0;
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int iq3 = (int)(ir / (neq2 * neq1));
+        const int iq2 = (int)((ir - iq3 * neq2 * neq1) / neq1);
+        const int iq1 = (int)(ir - iq3 * neq2 * neq1 - iq2 * neq1);
+
+        const int kv2 = (int)(iq2 / rk2);
+        const int ik3 = iq3;
+
+        const char * q_row = (const char *) q->data + iq1 * nbq1 + iq2 * nbq2 + iq3 * nbq3;
+        float q_head[128];
+        for (int d = 0; d < 128; ++d) {
+            if (q->type == GGML_TYPE_F32) q_head[d] = ((const float *) q_row)[d];
+            else q_head[d] = GGML_FP16_TO_FP32(((const ggml_fp16_t *) q_row)[d]);
+        }
+
+        float * scores = tl_scores;
+        float M = -INFINITY;
+        for (int64_t ik1 = 0; ik1 < Nk; ++ik1) {
+            float s = -INFINITY;
+            bool masked = false;
+            if (mask) {
+                const char * mrow = (const char *) mask->data + iq1 * mask->nb[1];
+                if (mask->type == GGML_TYPE_F16) {
+                    const float mv = GGML_FP16_TO_FP32(((const ggml_fp16_t *) mrow)[ik1]);
+                    if (mv < -1e20f) masked = true;
+                } else if (mask->type == GGML_TYPE_F32) {
+                    const float mv = ((const float *) mrow)[ik1];
+                    if (mv < -1e20f) masked = true;
+                }
+            } else if (ik1 > iq1) {
+                masked = true;
+            }
+            if (!masked) {
+                if (mode == HQVM_HOL_MODE_ZERO) {
+                    s = 0.0f;
+                } else if (mode == HQVM_HOL_MODE_RANDOM) {
+                    rnd = rnd * 1664525u + 1013904223u;
+                    s = ((float)(rnd & 0xFFFFu) / 65535.0f) * 20.0f - 10.0f;
+                } else {
+                    const char * k_row = (const char *) k->data + ik1 * nbk1 + kv2 * nbk2 + ik3 * nbk3;
+                    s = hqvm_q8_cache_row_score(q_head, k_row, scale);
+                }
+            }
+            scores[ik1] = s;
+            if (s > M) M = s;
+        }
+
+        /* Softmax + Attn@V owned by gyroscopic (attn.c). */
+        /* CGM-lift: one byte per (token_pos, layer); depth = t*L+ell.
+         * KV head 0 + group leader (iq2==0); ith==0 owns traj. Magnitude untouched. */
+        if (hqvm_cgm_lift_enabled() && mode == HQVM_HOL_MODE_DOT
+            && kv2 == 0 && iq2 == 0 && ith == 0) {
+            static int s_lift_note = 0;
+            const uint32_t layer_idx = (uint32_t)hqvm_cgm_lift_layer();
+            /* Request start, or a longer prefill wave replacing a prior microbatch
+             * (Nk is often padded ≠ Nq, so do not require Nk==Nq). */
+            if (Nq > 1 && iq1 == 0 && layer_idx == 0) {
+                if (!hqvm_cgm_lift_seq_active()
+                    || (uint32_t)Nq >= hqvm_genealogy_seq_len()) {
+                    hqvm_cgm_lift_reset_sequence();
+                }
+            } else if (!hqvm_cgm_lift_seq_active()) {
+                hqvm_cgm_lift_reset_sequence();
+            }
+            const uint32_t layer_use = (uint32_t)hqvm_cgm_lift_layer();
+            uint32_t token_pos;
+            if (Nq > 1) {
+                token_pos = (uint32_t)iq1; /* prefill: token index in Q tile */
+                hqvm_genealogy_observe_prefill(token_pos);
+            } else {
+                /* Decode: sequence cursor — never padded nek1-1 (n_ctx inflate). */
+                token_pos = hqvm_genealogy_decode_token_pos();
+            }
+            uint64_t qsigns = 0;
+            for (int d = 0; d < 64; ++d) if (q_head[d] >= 0.0f) qsigns |= (1ull << d);
+            const uint8_t chi_q = gyroscopic_chirality_from_signs64(qsigns);
+            gyro_lift_attn_t lift;
+            hqvm_lift_attention_phase(
+                scores, k->data, Nk, /*head=*/0, chi_q, token_pos, layer_use,
+                (float)APERTURE_GAP, 0.25f, &lift);
+            lifted_any = 1;
+            if (s_lift_note < 3) {
+                fprintf(stderr,
+                    "[hqvm-cgm-lift] hook chi_q=%u argmax=%d byte=%02x has_chi=%d "
+                    "token_pos=%u layer=%u depth=%llu phase=%u fam=%u\n",
+                    (unsigned)chi_q, lift.argmax, (unsigned)lift.byte,
+                    hqvm_k_chi6_has(k->data),
+                    (unsigned)token_pos, (unsigned)layer_use,
+                    (unsigned long long)hqvm_genealogy_depth(token_pos, layer_use),
+                    (unsigned)lift.phase_idx, (unsigned)lift.fam);
+                s_lift_note++;
+            }
+        }
+        if (hqvm_percolation_shadow_enabled()) {
+            hqvm_percolation_shadow(scores, Nk, M);
+        }
+        if (hqvm_attn_shell_qk_enabled() && mode == HQVM_HOL_MODE_DOT) {
+            const uint8_t Nc = hqvm_cgm_lift_enabled() ? hqvm_cgm_lift_carrier_shell() : 3;
+            hqvm_attn_weight_shell_qk(
+                scores, q_head, k->data, kv2, Nk, Nc, HQVM_ATTN_SHELL_TOPK);
+        } else if (hqvm_aperture_enabled() && mode == HQVM_HOL_MODE_DOT) {
+            const char * k0 = (const char *) k->data + kv2 * nbk2 + ik3 * nbk3;
+            hqvm_aperture_shadow(scores, q_head, k0, nbk1, Nk, 0.0206996f, 0.25f,
+                                k->data, kv2);
+            hqvm_aperture_softmax(scores, q_head, k0, nbk1, Nk, 0.0206996f, 0.25f,
+                                 k->data, kv2);
+            hqvm_stock_softmax_inc();
+        } else if (hqvm_shell_softmax_enabled() && mode == HQVM_HOL_MODE_DOT) {
+            const char * k0 = (const char *) k->data + kv2 * nbk2 + ik3 * nbk3;
+            hqvm_shell_softmax(scores, q_head, k0, nbk1, Nk, hqvm_shell_softmax_lambda());
+            hqvm_stock_softmax_inc();
+        } else if (hqvm_percolation_enabled() && mode == HQVM_HOL_MODE_DOT) {
+            const char * k0 = (const char *) k->data + kv2 * nbk2 + ik3 * nbk3;
+            hqvm_percolation_softmax(scores, q_head, k0, nbk1, Nk);
+            if (ik3 == 0 && iq1 == 0 && iq2 == 0) hqvm_percolation_gates_report();
+            hqvm_stock_softmax_inc();
+        } else {
+            hqvm_softmax_inplace(scores, Nk, M);
+            hqvm_stock_softmax_inc();
+        }
+
+        float * VKQ32 = tl_vkq;
+        const int v_is_q8 = (v->type == GGML_TYPE_Q8_0) ? 1 : 0;
+        if (v_is_q8) {
+            const char * v_base = (const char *) v->data + kv2 * nbv2 + ik3 * nbv3;
+            hqvm_attn_v_reduce(VKQ32, DV, scores, Nk, v_base, (size_t)nbv1,
+                               1, hqvm_v_perturb_enabled());
+        } else {
+            /* Stock F16/F32 V (only when GYRO_KV_V off) — ggml type stays in hook. */
+            for (int64_t d = 0; d < DV; ++d) VKQ32[d] = 0.0f;
+            for (int64_t ik1 = 0; ik1 < Nk; ++ik1) {
+                const float a = scores[ik1];
+                if (a == 0.0f) continue;
+                const char * v_row = (const char *) v->data + ik1 * nbv1 + kv2 * nbv2 + ik3 * nbv3;
+                for (int64_t d = 0; d < DV; ++d) {
+                    float vv = (v->type == GGML_TYPE_F32)
+                        ? ((const float *) v_row)[d]
+                        : GGML_FP16_TO_FP32(((const ggml_fp16_t *) v_row)[d]);
+                    VKQ32[d] += a * vv;
+                }
+            }
+        }
+        memcpy((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + iq1 * ne1) * nb1, VKQ32, nb1);
+    }
+
+    ggml_barrier(params->threadpool);
+    if (ith == 0) {
+        hqvm_holonomic_counters_inc(1);
+        /* Bump layer only when this FA call performed MVG lift(s). Ghost FA must not advance clock. */
+        if (hqvm_cgm_lift_enabled() && lifted_any) {
+            hqvm_cgm_lift_bump_layer();
+            static int s_lift_ctr = 0;
+            s_lift_ctr++;
+            if (s_lift_ctr == 1 || (s_lift_ctr % HQVM_N_LAYER) == 0) {
+                hqvm_cgm_lift_counters_print();
+            }
+        }
+        if (hqvm_receipts_enabled()) {
+            static int s_layer = 0;
+            uint8_t intron = 0;
+            if (k->type == GGML_TYPE_Q8_0 && Nk > 0) {
+                intron = hqvm_intron_from_q8_row((const char *) k->data + (Nk - 1) * nbk1);
+            }
+            hqvm_receipts_on_layer(intron, s_layer, Nk);
+            s_layer = (s_layer + 1) % HQVM_N_LAYER;
+        }
+        static int s_once = 0;
+        static int s_hol_print = 0;
+        s_hol_print += 1;
+        if (s_hol_print == 1 || (s_hol_print % HQVM_N_LAYER) == 0) {
+            hqvm_holonomic_counters_print();
+        }
+        if (!s_once) {
+            const char *mode_s = "q8_cache_dot";
+            if (mode == HQVM_HOL_MODE_ZERO) mode_s = "zero_scores";
+            else if (mode == HQVM_HOL_MODE_RANDOM) mode_s = "random_scores";
+            fprintf(stderr,
+                    "[hqvm-holonomic] flash_attn score hook active mode=%s "
+                    "K_cache=Q8_0 K_B_per_tok_layer=%lld allocated_F16_K=NONE reclaim=no-alloc\n",
+                    mode_s, (long long)ggml_row_size(GGML_TYPE_Q8_0, 128) * 8);
+            fflush(stderr);
+            s_once = 1;
+        }
+    }
+    return true;
+}
+
+/* Dump live blk.0 Q/K (first flash_attn) for Phase 5 live Khat calibration.
+ * Env: GYRO_DUMP_ATTN=<path_prefix>  writes <prefix>.qk.bin once. */
+static void hqvm_dump_attn_qk_once(
+        const ggml_compute_params * params,
+        const ggml_tensor * q,
+        const ggml_tensor * k,
+        float scale) {
+    const char * prefix = getenv("GYRO_DUMP_ATTN");
+    if (!prefix || !prefix[0] || !q || !k || params->ith != 0) return;
+    if (k->type == GGML_TYPE_Q8_0) return; /* Arc 2B-2: no float K to dump */
+
+    static int s_dumped = 0;
+    if (s_dumped) return;
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k, nb)
+
+    const int64_t DK = nek0;
+    const int64_t Nq = neq1;
+    const int64_t Nk = nek1;
+    const int64_t Hq = neq2;
+    const int64_t Hk = nek2;
+    if (DK <= 0 || Nq <= 0 || Nk <= 0 || Hq <= 0 || Hk <= 0) return;
+    /* Prefill-sized queries; KV may be padded (Nk >= Nq). */
+    if (Nq < 8 || Nk < Nq) return;
+    if (q->type != GGML_TYPE_F16 && q->type != GGML_TYPE_F32) return;
+    if (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_F32) return;
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.qk.bin", prefix);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[hqvm-dump] open failed %s\n", path);
+        fflush(stderr);
+        return;
+    }
+    /* header: magic, ver, Nq, Nk, Hq, Hk, DK, scale */
+    const char magic[8] = {'H','Q','V','M','D','U','M','P'};
+    const uint32_t ver = 1;
+    const uint32_t hdr[6] = {
+        (uint32_t)Nq, (uint32_t)Nq, (uint32_t)Hq, (uint32_t)Hk, (uint32_t)DK, 0
+    };
+    fwrite(magic, 1, 8, f);
+    fwrite(&ver, 4, 1, f);
+    fwrite(hdr, 4, 6, f);
+    fwrite(&scale, 4, 1, f);
+
+    /* Q: [token, head, dim] */
+    for (int64_t t = 0; t < Nq; ++t) {
+        for (int64_t h = 0; h < Hq; ++h) {
+            const char * row = (const char *) q->data + t * nbq1 + h * nbq2;
+            for (int64_t d = 0; d < DK; ++d) {
+                float v;
+                if (q->type == GGML_TYPE_F32) v = ((const float *) row)[d];
+                else v = GGML_FP16_TO_FP32(((const ggml_fp16_t *) row)[d]);
+                fwrite(&v, 4, 1, f);
+            }
+        }
+    }
+    /* K: only first Nq tokens (prompt positions); ignore KV pad */
+    for (int64_t t = 0; t < Nq; ++t) {
+        for (int64_t h = 0; h < Hk; ++h) {
+            const char * row = (const char *) k->data + t * nbk1 + h * nbk2;
+            for (int64_t d = 0; d < DK; ++d) {
+                float v;
+                if (k->type == GGML_TYPE_F32) v = ((const float *) row)[d];
+                else v = GGML_FP16_TO_FP32(((const ggml_fp16_t *) row)[d]);
+                fwrite(&v, 4, 1, f);
+            }
+        }
+    }
+    fclose(f);
+    s_dumped = 1;
+    fprintf(stderr, "[hqvm-dump] wrote %s Nq=%d Nk_used=%d Hq=%d Hk=%d D=%d (pad_Nk=%d)\n",
+            path, (int)Nq, (int)Nq, (int)Hq, (int)Hk, (int)DK, (int)Nk);
+    fflush(stderr);
+}
+
 void ggml_compute_forward_flash_attn_ext(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+
+    /* Live dump of first flash_attn Q/K (blk.0) for Phase 5 recalibration. */
+    {
+        static int s_fa_for_dump = 0;
+        float scale = 1.0f;
+        memcpy(&scale, (float *) dst->op_params + 0, sizeof(float));
+        if (params->ith == 0 && s_fa_for_dump == 0) {
+            hqvm_dump_attn_qk_once(params, dst->src[0], dst->src[1], scale);
+        }
+        if (params->ith == 0) {
+            s_fa_for_dump += 1;
+            if (s_fa_for_dump >= 36) s_fa_for_dump = 0;
+        }
+        ggml_barrier(params->threadpool);
+    }
+
+    /* Arc 2A: int8 QK score hook when GYRO_HOLONOMIC_ATTN=1.
+     * Softmax + Attn@V stay stock. Float K/V cache unchanged (Arc 2B open). */
+    if (hqvm_holonomic_attn_enabled()) {
+        ggml_barrier(params->threadpool);
+        if (ggml_compute_forward_flash_attn_holonomic(params, dst)) {
+            return;
+        }
+        /* Holonomic entry failed shape checks → stock path below. */
+    }
+
+    if (params->ith == 0) {
+        hqvm_holonomic_counters_inc(0);
+        static int s_stock_print = 0;
+        s_stock_print += 1;
+        if (s_stock_print == 1 || (s_stock_print % 36) == 0) {
+            hqvm_holonomic_counters_print();
+        }
+    }
+
     switch (dst->op_params[3]) {
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:

@@ -12,6 +12,8 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <cstdlib>
+#include <cstdio>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -83,6 +85,26 @@ llama_kv_cache::llama_kv_cache(
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl) {
+
+    // Arc 2B-2: displace float K cache with ggml Q8_0 when GYRO_KV_KQ8=1.
+    // Quantized at post-RoPE write by ggml_set_rows (cpy_k), read in-place by holonomic scorer.
+    {
+        const char * e = getenv("GYRO_KV_KQ8");
+        if (e && e[0] && e[0] != '0' && type_k == GGML_TYPE_F16) {
+            LLAMA_LOG_INFO("%s: GYRO_KV_KQ8=1: K cache type F16 -> Q8_0 (float K displaced)\n", __func__);
+            type_k = GGML_TYPE_Q8_0;
+        }
+    }
+
+    // Arc 3C: displace float V cache with ggml Q8_0 when GYRO_KV_V=1.
+    // Quantized at write by ggml_set_rows (cpy_v), read in-place by hqvm Attn@V reduction.
+    {
+        const char * e = getenv("GYRO_KV_V");
+        if (e && e[0] && e[0] != '0' && type_v == GGML_TYPE_F16) {
+            LLAMA_LOG_INFO("%s: GYRO_KV_V=1: V cache type F16 -> Q8_0 (float V displaced)\n", __func__);
+            type_v = GGML_TYPE_Q8_0;
+        }
+    }
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the
@@ -233,6 +255,24 @@ llama_kv_cache::llama_kv_cache(
 
         has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
+
+        /* Arc 2B-2 allocator audit (proof at construction, not Python). */
+        if (has_k && k) {
+            const size_t k_bpt = ggml_row_size(k->type, n_embd_k_gqa);
+            const char * f16_state = (k->type == GGML_TYPE_F16) ? "ALLOCATED" : "NOT_ALLOCATED";
+            fprintf(stderr, "[hqvm] KVCACHE layer=%u K_type=%s K_bytes/token=%zu F16_K=%s\n",
+                    il, ggml_type_name(k->type), k_bpt, f16_state);
+            fflush(stderr);
+        }
+
+        /* Arc 3C allocator audit for the V cache. */
+        if (has_v && v) {
+            const size_t v_bpt = ggml_row_size(v->type, n_embd_v_gqa);
+            const char * f16_state = (v->type == GGML_TYPE_F16) ? "ALLOCATED" : "NOT_ALLOCATED";
+            fprintf(stderr, "[hqvm] KVCACHE layer=%u V_type=%s V_bytes/token=%zu F16_V=%s\n",
+                    il, ggml_type_name(v->type), v_bpt, f16_state);
+            fflush(stderr);
+        }
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;

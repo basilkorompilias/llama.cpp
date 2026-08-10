@@ -14,10 +14,17 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+#if defined(GGML_GYROSCOPIC)
+#include "layer.h"
+#include "attn.h"
+#include "codec.h"
+#endif
 
 //
 // llama_context
@@ -1342,6 +1349,71 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+
+#if defined(GGML_GYROSCOPIC)
+    /* Register Q1_0 block weight views so native driver can run without stock MatMul. */
+    if (hqvm_native_forward_enabled() && !hqvm_native_weights_ready()) {
+        for (int il = 0; il < HQVM_N_LAYER; ++il) {
+            hqvm_block_weights_t W;
+            const hqvm_block_weights_t *prev = hqvm_block_get_weights(il);
+            if (prev) {
+                W = *prev;
+            } else {
+                memset(&W, 0, sizeof(W));
+            }
+            auto bind = [&](const char * suffix, hqvm_q1_weight_t * slot) {
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%d.%s", il, suffix);
+                const ggml_tensor * t = model.get_tensor(name);
+                if (!t || !t->data) return;
+                slot->q1_data = t->data;
+                slot->n_rows = t->ne[1];
+                slot->n_cols = t->ne[0];
+                slot->row_stride_bytes = t->nb[1];
+            };
+            bind("attn_q.weight", &W.attn_q);
+            bind("attn_k.weight", &W.attn_k);
+            bind("attn_v.weight", &W.attn_v);
+            bind("attn_output.weight", &W.attn_o);
+            bind("ffn_gate.weight", &W.ffn_gate);
+            bind("ffn_up.weight", &W.ffn_up);
+            bind("ffn_down.weight", &W.ffn_down);
+            {
+                char nname[128];
+                snprintf(nname, sizeof(nname), "blk.%d.attn_norm.weight", il);
+                const ggml_tensor * tn = model.get_tensor(nname);
+                if (tn && tn->data && tn->type == GGML_TYPE_F32) {
+                    W.attn_norm_g = (const float *)tn->data;
+                    hqvm_norm_set_g0_from_gains(W.attn_norm_g, tn->ne[0]);
+                    W.attn_norm_g0 = hqvm_norm_g0();
+                }
+                snprintf(nname, sizeof(nname), "blk.%d.ffn_norm.weight", il);
+                tn = model.get_tensor(nname);
+                if (tn && tn->data && tn->type == GGML_TYPE_F32) {
+                    W.ffn_norm_g = (const float *)tn->data;
+                    hqvm_norm_set_g0_from_gains(W.ffn_norm_g, tn->ne[0]);
+                    W.ffn_norm_g0 = hqvm_norm_g0();
+                }
+                snprintf(nname, sizeof(nname), "blk.%d.attn_q_norm.weight", il);
+                tn = model.get_tensor(nname);
+                if (tn && tn->data && tn->type == GGML_TYPE_F32) {
+                    W.attn_q_norm_g = (const float *)tn->data;
+                    W.attn_q_norm_g0 = hqvm_norm_geomean_gains(W.attn_q_norm_g, tn->ne[0]);
+                }
+                snprintf(nname, sizeof(nname), "blk.%d.attn_k_norm.weight", il);
+                tn = model.get_tensor(nname);
+                if (tn && tn->data && tn->type == GGML_TYPE_F32) {
+                    W.attn_k_norm_g = (const float *)tn->data;
+                    W.attn_k_norm_g0 = hqvm_norm_geomean_gains(W.attn_k_norm_g, tn->ne[0]);
+                }
+            }
+            hqvm_block_register_weights(il, &W);
+        }
+        if (hqvm_native_weights_ready()) {
+            LLAMA_LOG_INFO("%s: hqvm native weights ready (L=%d)\n", __func__, HQVM_N_LAYER);
+        }
+    }
+#endif
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {

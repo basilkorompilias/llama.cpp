@@ -14,6 +14,10 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "ledger.h"
+#include "layer.h"
+#include "attn.h"
+#include "codec.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -34,6 +38,9 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -1258,6 +1265,217 @@ void ggml_compute_forward_mul_mat(
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
+    /* Displace-BLAS: GYRO_LEDGER_PATH.
+     * Prefer thin HQVMLEDS (weights from ggml Q1_0 RAM). Fat HQVMLEDG v2 only
+     * if file magic is HQVMLEDG (bridge). STRICT: allowlist match that cannot
+     * displace aborts — never silent stock. */
+    {
+        static hqvm_sidecar g_side;
+        static hqvm_ledger g_fat;
+        static volatile int g_mode = 0; /* 0=none 2=sidecar 3=fat 4=fail */
+        static volatile long long g_hits = 0;
+        const char * ledger_path = getenv("GYRO_LEDGER_PATH");
+        const int strict = (getenv("GYRO_LEDGER_STRICT") != NULL);
+
+        if (ledger_path && ledger_path[0] && g_mode == 0) {
+            if (params->ith == 0) {
+                FILE *pf = fopen(ledger_path, "rb");
+                char magic[8] = {0};
+                if (pf) {
+                    if (fread(magic, 1, 8, pf) != 8) magic[0] = 0;
+                    fclose(pf);
+                }
+                if (memcmp(magic, "HQVMLEDS", 8) == 0) {
+                    if (hqvm_sidecar_load(&g_side, ledger_path) == 0) {
+                        hqvm_sidecar_apply_env_allow(&g_side);
+                        if (g_side.n_allow == 0) {
+                            const char * want = getenv("GYRO_LEDGER_TENSOR");
+                            if (!want || !want[0]) want = "attn_q.weight";
+                            strncpy(g_side.allow[0], want, HQVM_SIDECAR_ALLOW_LEN - 1);
+                            g_side.n_allow = 1;
+                        }
+                        g_mode = 2;
+                        fprintf(stderr, "[hqvm] SIDECAR loaded n_bin=%u allow=%u %s\n",
+                                g_side.n_bin, g_side.n_allow, ledger_path);
+                        for (uint32_t ai = 0; ai < g_side.n_allow; ++ai) {
+                            fprintf(stderr, "[hqvm]   allow[%u]=%s\n", ai, g_side.allow[ai]);
+                        }
+                    } else {
+                        g_mode = 4;
+                        fprintf(stderr, "[hqvm] SIDECAR load FAILED %s\n", ledger_path);
+                    }
+                } else if (memcmp(magic, "HQVMLEDG", 8) == 0) {
+                    if (hqvm_ledger_load(&g_fat, ledger_path) == 0) {
+                        g_mode = 3;
+                        fprintf(stderr, "[hqvm] FAT bridge rows=%u blocks=%u (prefer SIDECAR)\n",
+                                g_fat.n_rows, g_fat.n_blocks);
+                    } else {
+                        g_mode = 4;
+                        fprintf(stderr, "[hqvm] FAT load FAILED %s\n", ledger_path);
+                    }
+                } else {
+                    g_mode = 4;
+                    fprintf(stderr, "[hqvm] unknown ledger magic at %s\n", ledger_path);
+                }
+                fflush(stderr);
+            }
+            ggml_barrier(params->threadpool);
+        }
+
+        if (g_mode == 2) {
+            const int name_ok = hqvm_sidecar_allows(&g_side, src0->name);
+            const int64_t K = src0->ne[0];
+            const int64_t N = src1->ne[1];
+            const int64_t M = src0->ne[1];
+            const int type_ok = (src0->type == GGML_TYPE_Q1_0);
+            const int act_ok =
+                (src1->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(src1) &&
+                (src1->nb[0] == (int64_t)sizeof(float));
+            const int dims_ok = (K > 0) && (M > 0) && ((K % 128) == 0);
+            const int can = name_ok && type_ok && act_ok && dims_ok && (src0->data != NULL);
+
+            if (name_ok && !can) {
+                if (params->ith == 0 && getenv("GYRO_LEDGER_VERBOSE") != NULL) {
+                    fprintf(stderr,
+                            "[hqvm] cannot displace name=%s type=%d act_ok=%d M=%lld K=%lld\n",
+                            src0->name, (int)src0->type, act_ok, (long long)M, (long long)K);
+                    fflush(stderr);
+                }
+                if (strict) {
+                    ggml_barrier(params->threadpool);
+                    GGML_ABORT("[hqvm] STRICT: allowlist match but cannot displace");
+                }
+            }
+            if (can) {
+                /* Per-thread q8 quantize (no mid-loop barriers) + row-parallel gemv. */
+#if defined(_MSC_VER)
+                static __declspec(thread) int8_t * tls_qx = NULL;
+                static __declspec(thread) float * tls_xd = NULL;
+                static __declspec(thread) int64_t tls_cap = 0;
+#else
+                static __thread int8_t * tls_qx = NULL;
+                static __thread float * tls_xd = NULL;
+                static __thread int64_t tls_cap = 0;
+#endif
+                const int ith = params->ith;
+                const int nth = params->nth;
+                const int64_t dr = (M + nth - 1) / nth;
+                const int64_t r0 = ith * dr;
+                const int64_t r1 = (r0 + dr < M) ? (r0 + dr) : M;
+                const int verbose = (getenv("GYRO_LEDGER_VERBOSE") != NULL);
+
+                if (ith == 0) {
+                    atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+                }
+                if (K > tls_cap) {
+                    free(tls_qx);
+                    free(tls_xd);
+                    tls_qx = (int8_t *)malloc((size_t)K);
+                    tls_xd = (float *)malloc((size_t)(K / 32) * sizeof(float));
+                    tls_cap = (tls_qx && tls_xd) ? K : 0;
+                    if (!tls_cap) {
+                        free(tls_qx); free(tls_xd); tls_qx = NULL; tls_xd = NULL;
+                        if (strict) {
+                            ggml_barrier(params->threadpool);
+                            GGML_ABORT("[hqvm] STRICT: q8 scratch alloc failed");
+                        }
+                        ggml_barrier(params->threadpool);
+                        return;
+                    }
+                }
+                for (int64_t n = 0; n < N; ++n) {
+                    const float * x = (const float *)((const char *)src1->data + n * src1->nb[1]);
+                    float * y = (float *)((char *)dst->data + n * dst->nb[1]);
+                    hqvm_quantize_x_q8(x, K, tls_qx, tls_xd);
+                    if (hqvm_forward_q1_0_q8(&g_side, src0->data, M, K, src0->nb[1], tls_qx, tls_xd, y, r0, r1) != 0) {
+                        if (ith == 0 && verbose) {
+                            fprintf(stderr, "[hqvm] forward_q1_0 FAILED %s\n", src0->name);
+                            fflush(stderr);
+                        }
+                        if (strict) {
+                            ggml_barrier(params->threadpool);
+                            GGML_ABORT("[hqvm] STRICT: forward failed");
+                        }
+                    }
+                }
+                if (ith == 0) {
+                    g_hits += N;
+/* Phase 0 comment → native driver: register layer weight views. */
+                    {
+                        const char *nm = src0->name ? src0->name : "";
+                        int il = -1;
+                        const char *p = strstr(nm, "blk.");
+                        if (p) {
+                            il = atoi(p + 4);
+                        }
+                        if (il >= 0 && il < HQVM_N_LAYER) {
+                            hqvm_layer_weights_t wcur;
+                            const hqvm_layer_weights_t *prev = hqvm_layer_get_weights(il);
+                            if (prev) wcur = *prev;
+                            else memset(&wcur, 0, sizeof(wcur));
+                            hqvm_q1_weight_t slot;
+                            slot.q1_data = src0->data;
+                            slot.n_rows = M;
+                            slot.n_cols = K;
+                            slot.row_stride_bytes = src0->nb[1];
+                            if (strstr(nm, "attn_q")) wcur.attn_q = slot;
+                            else if (strstr(nm, "attn_k")) wcur.attn_k = slot;
+                            else if (strstr(nm, "attn_v")) wcur.attn_v = slot;
+                            else if (strstr(nm, "attn_output") || strstr(nm, "attn_o")) wcur.attn_o = slot;
+                            else if (strstr(nm, "ffn_gate")) wcur.ffn_gate = slot;
+                            else if (strstr(nm, "ffn_up")) wcur.ffn_up = slot;
+                            else if (strstr(nm, "ffn_down")) wcur.ffn_down = slot;
+                            hqvm_layer_register_weights(il, &wcur);
+                        }
+                    }
+                    if (verbose || g_hits == (long long)N) {
+                        fprintf(stderr, "[hqvm] displaced %s  M=%lld N=%lld K=%lld  hits=%lld nth=%d\n",
+                                src0->name, (long long)M, (long long)N, (long long)K,
+                                (long long)g_hits, nth);
+                        fflush(stderr);
+                    }
+                }
+                ggml_barrier(params->threadpool);
+                return;
+            }
+        }
+
+        if (g_mode == 3) {
+            const char * want = getenv("GYRO_LEDGER_TENSOR");
+            if (!want || !want[0]) want = "blk.0.attn_q";
+            const int name_ok = (src0->name[0] != 0) && (strstr(src0->name, want) != NULL);
+            const int64_t K = src0->ne[0];
+            const int64_t N = src1->ne[1];
+            const int64_t M = src0->ne[1];
+            const int dims_ok =
+                (src1->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(src1) &&
+                (src1->nb[0] == (int64_t)sizeof(float)) &&
+                ((uint32_t)K == g_fat.n_blocks * g_fat.block_w) &&
+                ((uint32_t)M == g_fat.n_rows);
+            if (name_ok && !dims_ok && strict) {
+                ggml_barrier(params->threadpool);
+                GGML_ABORT("[hqvm] STRICT: fat allowlist match but cannot displace");
+            }
+            if (name_ok && dims_ok) {
+                if (params->ith == 0) {
+                    atomic_store_explicit(&params->threadpool->current_chunk, params->nth, memory_order_relaxed);
+                    for (int64_t n = 0; n < N; ++n) {
+                        const float * x = (const float *)((const char *)src1->data + n * src1->nb[1]);
+                        float * y = (float *)((char *)dst->data + n * dst->nb[1]);
+                        hqvm_ledger_forward_f32(&g_fat, x, y);
+                        g_hits++;
+                    }
+                    fprintf(stderr, "[hqvm] fat-displaced %s  hits=%lld\n", src0->name, (long long)g_hits);
+                    fflush(stderr);
+                }
+                ggml_barrier(params->threadpool);
+                return;
+            }
+        }
+    }
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && !params->use_ref) {
         ggml_compute_forward_fwht(params, dst);
@@ -1708,11 +1926,277 @@ static void ggml_compute_forward_mul_mat_id(
 
 /////////////////////////////////
 
+/////////////////////////////////
+
+static int hqvm_tensor_is_block_node(const struct ggml_tensor * tensor) {
+    const char *dash;
+    char *end = NULL;
+    long il;
+    if (!tensor || !tensor->name || !tensor->name[0]) return 0;
+    /* Layer-scoped nodes are named "op-IL" (il = 0..L-1). Final "norm" has no dash index. */
+    dash = strrchr(tensor->name, '-');
+    if (!dash || !dash[1]) return 0;
+    il = strtol(dash + 1, &end, 10);
+    if (end == dash + 1 || (end && *end != '\0')) return 0;
+    return (il >= 0 && il < HQVM_N_LAYER) ? 1 : 0;
+}
+
+/* True if this node is transformer-block work that native driver must own / skip. */
+static int hqvm_tensor_is_stock_block_work(const struct ggml_tensor * tensor) {
+    int i;
+    if (!tensor) return 0;
+    if (hqvm_tensor_is_block_node(tensor)) return 1;
+    /* Flash-attn / rope / softmax / glu often lack "-IL" names on the op node itself. */
+    switch (tensor->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_BACK:
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_SOFT_MAX_BACK:
+        case GGML_OP_GLU:
+        case GGML_OP_SET_ROWS: /* native KV owns cache writes under bypass */
+            return 1;
+        case GGML_OP_GET_ROWS:
+            /* Qwen3 selects output rows inside the final block. If its source
+             * is layer-35 work, native injection already supplied the row. */
+            for (i = 0; i < GGML_MAX_SRC; ++i) {
+                const struct ggml_tensor * s = tensor->src[i];
+                if (s && hqvm_tensor_is_block_node(s)) return 1;
+            }
+            return 0;
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_RMS_NORM_BACK:
+            if (tensor->name && strcmp(tensor->name, "norm") == 0) return 0; /* final norm */
+            if (tensor->name && (strstr(tensor->name, "attn_norm") || strstr(tensor->name, "ffn_norm"))) {
+                return 1;
+            }
+            /* Unnamed / fused layer norms: treat as block if any src is residual-sized and not final. */
+            return hqvm_tensor_is_block_node(tensor);
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            for (i = 0; i < GGML_MAX_SRC; ++i) {
+                const struct ggml_tensor * s = tensor->src[i];
+                if (s && s->name && strstr(s->name, "blk.") != NULL) return 1;
+            }
+            return 0;
+        default:
+            return 0;
+    }
+}
+
+/* Classify stock ops that still execute under native mode (Gate 0A / 2A). */
+static void hqvm_count_stock_op_if_running(const struct ggml_tensor * tensor) {
+    int i;
+    if (!tensor || !hqvm_native_forward_enabled()) return;
+    switch (tensor->op) {
+        case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_FLASH_ATTN_BACK:
+            hqvm_stock_flash_attn_inc();
+            break;
+        case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
+            hqvm_stock_rope_inc();
+            break;
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_RMS_NORM_BACK:
+            if (tensor->name && strcmp(tensor->name, "norm") == 0) {
+                hqvm_stock_tail_inc();
+            } else {
+                hqvm_stock_rmsnorm_inc();
+            }
+            break;
+        case GGML_OP_GLU:
+            hqvm_stock_swiglu_inc();
+            break;
+        case GGML_OP_SET_ROWS:
+            hqvm_stock_set_rows_inc();
+            break;
+        case GGML_OP_ADD:
+        case GGML_OP_ADD1:
+            if (hqvm_tensor_is_block_node(tensor)) hqvm_stock_add_inc();
+            break;
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT_ID:
+            for (i = 0; i < GGML_MAX_SRC; ++i) {
+                const struct ggml_tensor * s = tensor->src[i];
+                if (s && s->name && strcmp(s->name, "output.weight") == 0) {
+                    hqvm_stock_tail_inc();
+                    break;
+                }
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static int hqvm_native_inject_from_graph(const struct ggml_cgraph * cgraph) {
+    struct ggml_tensor * embd = NULL;
+    struct ggml_tensor * final_norm = NULL;
+    struct ggml_tensor * positions = NULL;
+    float *x = NULL;
+    const int32_t * pos_data = NULL;
+    int32_t pos0 = 0;
+    int32_t T;
+    int64_t H;
+    int i, rc;
+
+    static uint8_t s_u6 = 0, s_v6 = 0;
+
+    if (!cgraph) return -1;
+    for (i = 0; i < cgraph->n_nodes; ++i) {
+        struct ggml_tensor * n = cgraph->nodes[i];
+        if (!n || !n->name) continue;
+        if (strcmp(n->name, "embd") == 0) embd = n;
+        if (strcmp(n->name, "result_norm") == 0) final_norm = n;
+    }
+    if (!embd || !embd->data || embd->type != GGML_TYPE_F32) return -2;
+    H = embd->ne[0];
+    T = (int32_t)embd->ne[1];
+    if (H != HQVM_HIDDEN_DIM || T <= 0) return -3;
+
+    /* build_inp_pos() creates an unnamed I32 graph input consumed by RoPE. */
+    for (i = 0; i < cgraph->n_leafs; ++i) {
+        struct ggml_tensor * leaf = cgraph->leafs[i];
+        if (leaf && leaf->data && leaf->type == GGML_TYPE_I32 && leaf->ne[0] >= T &&
+            (leaf->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+            int n, used_by_rope = 0;
+            for (n = 0; n < cgraph->n_nodes && !used_by_rope; ++n) {
+                struct ggml_tensor * node = cgraph->nodes[n];
+                int s;
+                if (!node || node->op != GGML_OP_ROPE) continue;
+                for (s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (node->src[s] == leaf) { used_by_rope = 1; break; }
+                }
+            }
+            if (used_by_rope) { positions = leaf; break; }
+        }
+    }
+    if (positions) {
+        pos_data = (const int32_t *)positions->data;
+        pos0 = pos_data[0];
+    }
+
+    {
+        static int s_reset_env = -1;
+        if (s_reset_env < 0) {
+            const char *e = getenv("GYRO_NATIVE_RESET");
+            s_reset_env = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (s_reset_env) {
+            hqvm_native_sequence_reset();
+        }
+    }
+
+    {
+        hqvm_block_kv_t * kv = hqvm_native_kv_get(4096);
+        int is_prefill;
+
+        if (!kv) return -4;
+
+        /* The graph's absolute positions are authoritative for sequence lifecycle. */
+        is_prefill = !hqvm_native_prefill_done() || T > 1 ||
+            (pos_data && (pos0 == 0 || pos0 <= kv->kv_pos));
+        if (is_prefill) {
+            hqvm_native_sequence_reset();
+        }
+
+        hqvm_native_request_begin(is_prefill, T);
+
+        x = (float *)malloc((size_t)T * (size_t)H * sizeof(float));
+        if (!x) return -5;
+        for (i = 0; i < T; ++i) {
+            const float *row = (const float *)((const char *)embd->data + (size_t)i * embd->nb[1]);
+            memcpy(x + (size_t)i * (size_t)H, row, (size_t)H * sizeof(float));
+        }
+
+        if (is_prefill) {
+            /* Current Qwen3 text batches are contiguous from pos0. */
+            if (pos_data && pos0 != 0) {
+                rc = -6;
+            } else {
+                rc = hqvm_forward_prefill(x, T, x, H, &s_u6, &s_v6, kv);
+            }
+            hqvm_native_mark_prefill_done();
+        } else {
+            rc = 0;
+            for (i = 0; i < T; ++i) {
+                const int32_t pos = pos_data ? pos_data[i] : (int32_t)(kv->kv_pos + 1 + i);
+                rc = hqvm_forward_decode_step(
+                    x + (size_t)i * HQVM_HIDDEN_DIM, pos, &s_u6, &s_v6, kv);
+                if (rc != 0) break;
+            }
+        }
+
+        if (rc != 0) {
+            fprintf(stderr, "[hqvm-native] forward failed rc=%d is_prefill=%d\n",
+                rc, is_prefill);
+            free(x);
+            return rc;
+        }
+
+        if (final_norm && final_norm->src[0] && final_norm->src[0]->src[0] &&
+            final_norm->src[0]->src[0]->data &&
+            final_norm->src[0]->src[0]->type == GGML_TYPE_F32 &&
+            final_norm->src[0]->src[0]->ne[0] == H) {
+            /* result_norm = norm(residual) * output_norm.weight. Inject the
+             * native residual before the RMSNorm node, not into its output. */
+            struct ggml_tensor * resid = final_norm->src[0]->src[0];
+            const int64_t n_rows = resid->ne[1] > 0 ? resid->ne[1] : 1;
+            const int64_t copy_t = (n_rows < T) ? n_rows : T;
+            int64_t t;
+            for (t = 0; t < copy_t; ++t) {
+                const int64_t src_t = (n_rows < T) ? (T - copy_t + t) : t;
+                float *dst = (float *)((char *)resid->data + (size_t)t * resid->nb[1]);
+                memcpy(dst, x + (size_t)src_t * (size_t)H, (size_t)H * sizeof(float));
+            }
+            if (copy_t > 0) {
+                const int64_t src_t = (n_rows < T) ? (T - 1) : (copy_t - 1);
+                const float *xr = x + (size_t)src_t * (size_t)H;
+                const float *er = (const float *)((const char *)embd->data
+                    + (size_t)src_t * embd->nb[1]);
+                double s2x = 0.0, s2e = 0.0, dot = 0.0;
+                int64_t i;
+                for (i = 0; i < H; ++i) {
+                    s2x += (double)xr[i] * (double)xr[i];
+                    s2e += (double)er[i] * (double)er[i];
+                    dot += (double)xr[i] * (double)er[i];
+                }
+                fprintf(stderr,
+                    "[hqvm-native] resid_vs_embd t=%lld rms_x=%.5g rms_e=%.5g cos=%.5g\n",
+                    (long long)src_t,
+                    sqrt(s2x / (double)H), sqrt(s2e / (double)H),
+                    (s2x > 0.0 && s2e > 0.0) ? dot / sqrt(s2x * s2e) : 0.0);
+                fflush(stderr);
+            }
+        } else {
+            fprintf(stderr, "[hqvm-native] warning: final norm residual not found\n");
+        }
+
+        hqvm_native_counters_print("inject", is_prefill, T, kv->kv_pos);
+        free(x);
+        return 0;
+    }
+}
+
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
+    }
+
+    /* Native driver owns block work: skip stock compute when bypass active. */
+    if (hqvm_native_bypass_active() && hqvm_tensor_is_stock_block_work(tensor)) {
+        return;
+    }
+    if (hqvm_native_forward_enabled() && hqvm_tensor_is_stock_block_work(tensor) &&
+        !hqvm_native_bypass_active() && params->ith == 0) {
+        hqvm_stock_block_forward_inc();
+    }
+    if (params->ith == 0) {
+        hqvm_count_stock_op_if_running(tensor);
     }
 
     // extra_buffer op?
@@ -3075,6 +3559,28 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        /* Native driver: on first block work node, inject prefill/decode and bypass stock blocks. */
+        if (hqvm_native_forward_enabled() && hqvm_native_weights_ready() &&
+            hqvm_tensor_is_stock_block_work(node) && !hqvm_native_bypass_active()) {
+            ggml_barrier(state->threadpool);
+            if (state->ith == 0) {
+                hqvm_stock_block_forward_reset();
+                if (hqvm_native_inject_from_graph(cgraph) == 0) {
+                    hqvm_native_bypass_set(1);
+                } else {
+                    fprintf(stderr, "[hqvm-native] inject failed; stock block path\n");
+                    fflush(stderr);
+                }
+            }
+            ggml_barrier(state->threadpool);
+        }
+        if (hqvm_native_bypass_active() && hqvm_tensor_is_stock_block_work(node)) {
+            if (node_n + 1 < cgraph->n_nodes) {
+                ggml_barrier(state->threadpool);
+            }
+            continue;
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3093,6 +3599,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
+    }
+
+    ggml_barrier(state->threadpool);
+    if (state->ith == 0 && hqvm_native_bypass_active()) {
+        hqvm_native_bypass_set(0);
     }
 
 #ifdef GGML_USE_OPENMP
